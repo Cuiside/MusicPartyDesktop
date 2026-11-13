@@ -1,0 +1,5 @@
+NetEaseCloudMusicApiEnhanced 4.36.1
+Official upstream: https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced
+Windows release: https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced/releases/download/v4.36.1/ncm-api-win-x64.exe
+SHA256: b42124b5cbf2b128cf55fe3f0b17a601fb705ffdfd0d36f7d85829914edc6263
+This third-party component is distributed under its upstream license.

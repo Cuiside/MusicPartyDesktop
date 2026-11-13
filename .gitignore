@@ -1,0 +1,8 @@
+# Generated binaries and unpacked runtime
+package/local-server/*.exe
+package/local-server/win-unpacked/
+package/local-server/**/*.jar
+package/local-server/**/*.dll
+package/local-server/**/*.dat
+package/local-server/**/*.pak
+node_modules/
