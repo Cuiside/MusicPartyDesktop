@@ -1,27 +1,50 @@
-# MusicPartyDesktop
+# MusicParty Desktop
 
-基于 MusicParty 的 Windows Electron 桌面客户端与本地服务集成发行版。本仓库为个人 Private 备份。
+MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用，将桌面客户端与本地服务集成为一个发行版本。与朋友进入房间后，可以一起管理播放队列、聊天和分享音乐，同时保留本机独立的音量与静音控制。
 
-## 当前备份
+> 本项目**基于 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 开发**。感谢 MusicParty 原作者及贡献者提供的开源项目与付出！本项目为独立维护的桌面扩展，并非原项目官方发行版。
 
-- 版本：0.3.0-dev.2-clean-028393e
-- 变体：Windows local-server
-- 大型 EXE 不放入 Git 历史，作为 GitHub Release 资产保存；哈希见 docs/SHA256SUMS.txt。
+## 下载
 
-## 来源与许可
+前往 [Releases](https://github.com/Cuiside/MusicPartyDesktop/releases) 下载 Windows x64 版本。当前版本为 **0.9.4-beta.5**，属于预发布版本，使用中可能仍有问题。
 
-本项目基于 PluvIIter/MusicParty 开源项目开发；上游 MIT License、作者信息和来源链接应继续保留。桌面端新增代码与发行脚本由本项目维护。网易云 API、Java 运行时和演示素材遵循各自随包提供的许可证或 NOTICE。
+- **安装版（setup）**：运行安装程序，按提示选择安装位置。
+- **便携版（portable）**：下载后直接运行，无需安装。
+- **SHA256SUMS.txt**：用于校验下载文件的完整性。
+
+发行包尚未进行代码签名，Windows 可能显示安全提示；请仅从本仓库发行页面下载并核对校验值。覆盖安装前建议备份个人配置，并退出正在运行的程序。
+
+## 功能
+
+- 集成本地服务，创建或连接音乐房间，与成员共同听歌。
+- 查看及管理播放队列、搜索歌曲、使用歌单，点赞当前歌曲。
+- 房间聊天、即时聊天及消息通知。
+- 桌面歌词窗口，支持外观设置、背景和频谱显示。
+- 本机音量和静音控制，主题颜色及深色模式。
+
+具体功能和音乐来源的可用性取决于服务配置、账号权限和第三方接口状态。
+
+## 开始使用
+
+1. 从 Releases 下载适合自己的安装版或便携版并启动。
+2. 按应用内引导启动本地服务，或填写房间服务地址并连接。
+3. 设置昵称并进入房间，搜索或选择歌曲加入队列。
+4. 在设置中按需调整声音、外观和桌面歌词。
+
+使用网易云等第三方服务时，可能需要自行配置账号凭证。请勿将 Cookie、密码、房间管理凭证等分享给他人，也不要提交到公开仓库。请只在信任的网络及房间中使用；将服务暴露到公网前，应自行检查访问控制、默认密码及网络安全配置。
+
+## 问题反馈
+
+欢迎通过 [Issues](https://github.com/Cuiside/MusicPartyDesktop/issues) 报告问题。请尽量说明版本号、Windows 版本、复现步骤、预期与实际结果，以及经过脱敏的截图或日志。提交前请移除账号凭证和其他隐私信息。
+
+## 致谢与第三方许可
+
+- **MusicParty**：感谢 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 的作者与贡献者。上游 README 声明使用 MIT License；本项目与上游项目保持各自维护。
+- **NetEaseCloudMusicApiEnhanced**：项目及其贡献者提供的网易云音乐接口；相关许可见 [许可证](docs/NETEASE-API-LICENSE.txt) 和 [说明](docs/NETEASE-API-NOTICE.txt)。
+- **演示音乐**：《Upbeat Visual Novel Music》，作者 ViRiX，来源 [OpenGameArt](https://opengameart.org/content/upbeat-visual-novel-music)，按 [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) 授权使用。曲目：Dynamic Horizon、Dynamic Daydreams、Dynamic School Days、After School、DownTempo Avenue；音频未作修改。
+
+Electron、Java 运行时及其他第三方组件遵循各自的许可条款；其权利归各自权利人所有。
 
 ## 免责声明
 
-本项目仅供学习交流和非商业使用，不提供绕过版权、付费或平台访问控制的功能。使用者应遵守适用法律、第三方平台条款，并自行承担账号与音源使用责任。
-
-
-## 最新本地服务集成版
-
-当前归档版本为 0.3.1，基于 0.3.0-dev.2-clean-028393e 正确源码基线重新构建。
-
-- 仅发布 local-server 集成版；未上传远程版。
-- 大型 EXE 只作为 GitHub Release 资产，不写入 Git 历史。
-- SHA256 校验见 docs/SHA256SUMS.txt。
-
+本项目旨在补充 PC 端与朋友共同听歌的方式，仅供学习交流，不用于商业用途。本项目不提供音乐内容，也不提供绕过付费、版权或平台访问控制的功能。使用者应遵守适用法律及第三方平台条款，保护账号凭证，尊重版权并支持正版。第三方服务可能变更、中断或限制，本项目不代表任何音乐平台，也不保证第三方服务持续可用。
