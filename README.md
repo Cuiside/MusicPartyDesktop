@@ -51,6 +51,7 @@ MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用�
 - **MusicParty**：感谢 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 的作者与贡献者。上游 README 声明使用 MIT License；本项目与上游项目保持各自维护。
 - **NetEaseCloudMusicApiEnhanced**：项目及其贡献者提供的网易云音乐接口；相关许可见 [许可证](docs/NETEASE-API-LICENSE.txt) 和 [说明](docs/NETEASE-API-NOTICE.txt)。
 - **QQMusicApi**：感谢 [L-1124/QQMusicApi](https://github.com/L-1124/QQMusicApi) 及其贡献者提供的 QQ 音乐接口。
+- **OpenAI Codex**：感谢 [Codex](https://openai.com/codex/) 协助开发、测试及文档整理。
 - **演示音乐**：《Upbeat Visual Novel Music》，作者 ViRiX，来源 [OpenGameArt](https://opengameart.org/content/upbeat-visual-novel-music)，按 [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) 授权使用。曲目：Dynamic Horizon、Dynamic Daydreams、Dynamic School Days、After School、DownTempo Avenue；音频未作修改。
 
 Electron、Java 运行时及其他第三方组件遵循各自的许可条款；其权利归各自权利人所有。
