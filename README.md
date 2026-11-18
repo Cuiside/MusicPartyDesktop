@@ -6,7 +6,7 @@ MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用�
 
 ## 下载
 
-前往 [Releases](https://github.com/Cuiside/MusicPartyDesktop/releases) 下载 Windows x64 版本。最新公开版本为 **0.9.4-beta.5**；0.9.7 发行附件仍在上传，功能介绍包含 0.9.7 的更新。
+前往 [Releases](https://github.com/Cuiside/MusicPartyDesktop/releases) 下载 Windows x64 版本。当前版本为 **0.9.7**，使用中可能仍有问题。
 
 - **安装版（setup）**：运行安装程序，按提示选择安装位置。
 - **便携版（portable）**：下载后直接运行，无需安装。
