@@ -42,6 +42,16 @@ MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用�
 
 使用网易云等第三方服务时，可能需要自行配置账号凭证。请勿将 Cookie、密码、房间管理凭证等分享给他人，也不要提交到公开仓库。请只在信任的网络及房间中使用；将服务暴露到公网前，应自行检查访问控制、默认密码及网络安全配置。
 
+## 源码与开发
+
+- `src/`、`electron/` 和 `native/`：桌面应用源码；`tests/` 是桌面客户端的测试。
+- `server-source/`：0.9.7 内置服务端对应的源码快照及其 Web 前端；该发行版沿用 0.9.6 的服务端制品。
+- `public/demo-audio/`：演示音乐及其署名说明。运行缓存、用户配置、第三方运行时和发行包没有包含在源码仓库中。
+
+Windows 上安装 Node.js 和 npm 后，在仓库根目录运行 `npm ci`、`npm run build` 和 `npm test`；运行 `node --test tests/unit/*.test.mjs` 可执行客户端单元测试。服务端位于 `server-source/`，使用 JDK 21 或以上及其中的 Maven Wrapper 构建；Web 前端位于 `server-source/music-party-web/`。
+
+完整的本地服务集成发行包还需要另行准备 Java 运行时、服务端 JAR、网易云及 QQ 音乐接口运行时和桌面歌词原生模块。现有打包脚本中的服务端构建路径和资源准备流程尚未针对这个独立源码仓库完整验证，请不要将源码构建与现有 0.9.7 发行包视为可逐字节复现的结果。
+
 ## 问题反馈
 
 欢迎通过 [Issues](https://github.com/Cuiside/MusicPartyDesktop/issues) 报告问题。请尽量说明版本号、Windows 版本、复现步骤、预期与实际结果，以及经过脱敏的截图或日志。提交前请移除账号凭证和其他隐私信息。
@@ -50,12 +60,12 @@ MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用�
 
 - **MusicParty**：感谢 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 的作者与贡献者。上游 README 声明使用 MIT License；本项目与上游项目保持各自维护。
 - **NetEaseCloudMusicApiEnhanced**：项目及其贡献者提供的网易云音乐接口；相关许可见 [许可证](docs/NETEASE-API-LICENSE.txt) 和 [说明](docs/NETEASE-API-NOTICE.txt)。
-- **QQMusicApi**：感谢 [L-1124/QQMusicApi](https://github.com/L-1124/QQMusicApi) 及其贡献者提供的 QQ 音乐接口。
+- **QQMusicApi**：感谢 [L-1124/QQMusicApi](https://github.com/L-1124/QQMusicApi) 及其贡献者提供的 QQ 音乐接口。该第三方服务按 [GPL-3.0](docs/QQMUSIC-API-GPL-3.0.txt) 授权；其源码及许可证以该项目为准。
 - **OpenAI Codex**：感谢 [Codex](https://openai.com/codex/) 协助开发、测试及文档整理。
 - **演示音乐**：《Upbeat Visual Novel Music》，作者 ViRiX，来源 [OpenGameArt](https://opengameart.org/content/upbeat-visual-novel-music)，按 [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) 授权使用。曲目：Dynamic Horizon、Dynamic Daydreams、Dynamic School Days、After School、DownTempo Avenue；音频未作修改。
 
-Electron、Java 运行时及其他第三方组件遵循各自的许可条款；其权利归各自权利人所有。
+Electron、Java 运行时及其他第三方组件遵循各自的许可条款；其权利归各自权利人所有。Web 前端所用字体的许可文本位于 `server-source/music-party-web/public/fonts/`。
 
 ## 免责声明
 
-本项目旨在补充 PC 端与朋友共同听歌的方式，仅供学习交流，不用于商业用途。本项目不提供音乐内容，也不提供绕过付费、版权或平台访问控制的功能。使用者应遵守适用法律及第三方平台条款，保护账号凭证，尊重版权并支持正版。第三方服务可能变更、中断或限制，本项目不代表任何音乐平台，也不保证第三方服务持续可用。
+本项目旨在补充 PC 端与朋友共同听歌的方式。本项目不提供音乐内容，也不提供绕过付费、版权或平台访问控制的功能。使用者应遵守适用法律、项目和第三方组件的许可及平台条款，保护账号凭证，尊重版权并支持正版。第三方服务可能变更、中断或限制，本项目不代表任何音乐平台，也不保证第三方服务持续可用。

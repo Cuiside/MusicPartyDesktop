@@ -1,0 +1,559 @@
+package org.thornex.musicparty.service;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.thornex.musicparty.config.AppProperties;
+import org.thornex.musicparty.dto.Music;
+import org.thornex.musicparty.dto.MusicQueueItem;
+import org.thornex.musicparty.dto.UserSummary;
+import org.thornex.musicparty.enums.QueueItemStatus;
+import org.thornex.musicparty.enums.TopResult;
+import org.thornex.musicparty.enums.Priority;
+
+import org.thornex.musicparty.enums.PlayMode;
+import org.thornex.musicparty.source.ResourceKey;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+public class MusicQueueManager {
+
+    private final AppProperties appProperties;
+
+    // 使用并发安全的双端队列
+    private final Deque<MusicQueueItem> queue = new ConcurrentLinkedDeque<>();
+    private final List<Music> playHistory = Collections.synchronizedList(new LinkedList<>());
+
+    // 用于实现“公平随机播放”：记录上一个播放的用户
+    private final AtomicReference<String> lastPlayedUserToken = new AtomicReference<>("");
+
+    private final ShuffleCycle shuffleCycle = new ShuffleCycle();
+    private final Map<String, Long> playbackRetryAt = new HashMap<>();
+    private final Map<String, Boolean> memberShuffle = new HashMap<>();
+    private static final long PLAYBACK_RETRY_DELAY_MS = 30_000;
+
+    /** 私人FM 合成标记项常量 */
+    public static final String FM_MARKER_ID = "netease-fm";
+    public static final String FM_MARKER_USER_TOKEN = "__FM__";
+
+    // --- Public API for Queue Manipulation ---
+
+    /**
+     * 向队列末尾添加一首歌曲
+     */
+    public synchronized MusicQueueItem add(Music music, UserSummary enqueuedBy, QueueItemStatus initialStatus) {
+        // 检查队列是否已满
+        if (queue.size() >= appProperties.getQueue().getMaxSize()) {
+            return null;
+        }
+
+        // 防止重复添加
+        if (isMusicInQueue(music)) {
+            return null;
+        }
+
+        // Recheck the member quota while holding the same lock as insertion.
+        // API requests may have passed their earlier quota checks concurrently.
+        long userSongCount = queue.stream()
+                .filter(item -> item.enqueuedBy().token().equals(enqueuedBy.token()))
+                .count();
+        if (userSongCount >= appProperties.getQueue().getMaxUserSongs()) {
+            return null;
+        }
+
+        MusicQueueItem newItem = new MusicQueueItem(
+                UUID.randomUUID().toString(),
+                music,
+                enqueuedBy,
+                initialStatus // 存储枚举的名称
+        , org.thornex.musicparty.enums.Priority.REGULAR);
+        queue.addLast(newItem);
+        return newItem;
+    }
+
+    /**
+     * 将指定歌曲置顶
+     */
+    public synchronized TopResult top(String queueId, PlayMode playMode) {
+        Optional<MusicQueueItem> itemOpt = findByQueueId(queueId);
+        if (itemOpt.isEmpty()) {
+            return TopResult.NONE;
+        }
+
+        MusicQueueItem item = itemOpt.get();
+
+        // 1. 如果已经是全局置顶 (GLOBAL_TOP)，不做操作
+        if (item.priority() == Priority.GLOBAL_TOP) {
+            return TopResult.NONE;
+        }
+
+        // 2. 如果是个人置顶 (USER_TOP) -> 升级为全局置顶 (GLOBAL_TOP)
+        // 无论当前是否随机模式，二次置顶都视为升级
+        if (item.priority() == Priority.USER_TOP) {
+            if (queue.remove(item)) {
+                queue.addFirst(item.withPriority(Priority.GLOBAL_TOP));
+                return TopResult.GLOBAL;
+            }
+            return TopResult.NONE;
+        }
+
+        // 3. 如果是普通歌曲
+        if (playMode == PlayMode.ROUND_ROBIN) {
+            // 为了保持物理顺序不变（以便切换回顺序模式时不乱），我们需要原地替换
+            // 由于 ConcurrentLinkedDeque 不支持原地替换，我们用重建队列的方式
+            List<MusicQueueItem> snapshot = new ArrayList<>(queue);
+            int index = snapshot.indexOf(item);
+            if (index != -1) {
+                snapshot.set(index, item.withPriority(Priority.USER_TOP));
+                queue.clear();
+                queue.addAll(snapshot);
+                return TopResult.PERSONAL;
+            }
+        } else {
+            // 顺序模式或单曲循环下 -> 直接变为全局置顶 (GLOBAL_TOP)
+            if (queue.remove(item)) {
+                queue.addFirst(item.withPriority(Priority.GLOBAL_TOP));
+                return TopResult.GLOBAL;
+            }
+        }
+        return TopResult.NONE;
+    }
+
+    /**
+     * 从队列中移除指定用户的所有点歌
+     * @return 移除的数量
+     */
+    public synchronized int removeByUser(String userToken) {
+        List<MusicQueueItem> toRemove = queue.stream()
+                .filter(item -> item.enqueuedBy().token().equals(userToken))
+                .toList();
+        
+        toRemove.forEach(queue::remove);
+        shuffleCycle.prune(new ArrayList<>(queue));
+        return toRemove.size();
+    }
+
+    /**
+     * 根据 queueId 获取队列项（不移除）
+     */
+    public synchronized Optional<MusicQueueItem> getItem(String queueId) {
+        return findByQueueId(queueId);
+    }
+
+    /**
+     * 从队列中移除一首歌曲
+     */
+    public synchronized Optional<MusicQueueItem> remove(String queueId) {
+        Optional<MusicQueueItem> itemOpt = findByQueueId(queueId);
+        itemOpt.ifPresent(queue::remove);
+        shuffleCycle.prune(new ArrayList<>(queue));
+        return itemOpt;
+    }
+
+    /**
+     * 从队列中取出下一首可播放的歌曲
+     * @param playMode 当前播放模式
+     * @param allowOfflineShuffle 是否允许随机到离线用户的歌
+     * @param onlineUserTokens 在线用户的 Token 集合 (用于优先调度)
+     * @return 下一首歌曲，如果队列为空则返回 null
+     */
+    public synchronized MusicQueueItem pollNext(PlayMode playMode, boolean allowOfflineShuffle, Map<String, QueueItemStatus> statusMap, Set<String> onlineUserTokens) {
+        playbackRetryAt.entrySet().removeIf(entry -> entry.getValue() <= System.currentTimeMillis());
+        if (!appProperties.getQueue().isRetainPlaylist()) shuffleCycle.clear();
+        if (queue.isEmpty()) {
+            return pollFromHistory(); // 队列为空时，尝试从历史记录播放
+        }
+
+        List<MusicQueueItem> candidates = new ArrayList<>(queue);
+
+        // 1. 优先处理全局置顶项 (GLOBAL_TOP)
+        Optional<MusicQueueItem> topItem = candidates.stream()
+                .filter(item -> item.priority() == Priority.GLOBAL_TOP && isReadyOrFailed(statusMap, item))
+                .findFirst();
+
+        if (topItem.isPresent()) {
+            return select(topItem.get());
+        }
+
+        // 2. 移除全局置顶项，进行常规调度
+        List<MusicQueueItem> availableItems = candidates.stream()
+                .filter(item -> item.priority() != Priority.GLOBAL_TOP && isReadyOrFailed(statusMap, item))
+                .toList();
+
+        if (availableItems.isEmpty()) {
+            return null; // 所有歌曲都在下载中
+        }
+
+        MusicQueueItem chosenItem;
+        if (playMode == PlayMode.ROUND_ROBIN) {
+            chosenItem = pollNextFairShuffle(availableItems, onlineUserTokens, allowOfflineShuffle);
+        } else if (playMode == PlayMode.SHUFFLE) {
+            chosenItem = pollNextTotalShuffle(availableItems, onlineUserTokens, allowOfflineShuffle);
+        } else {
+            // 顺序播放或单曲循环模式下切歌：直接取第一个
+            chosenItem = availableItems.get(0);
+        }
+
+        if (chosenItem == null) {
+            return null;
+        }
+
+        return select(chosenItem);
+    }
+
+    private MusicQueueItem select(MusicQueueItem item) {
+        queue.remove(item);
+        if (appProperties.getQueue().isRetainPlaylist()) shuffleCycle.selected(item);
+        if (appProperties.getQueue().isRetainPlaylist() && !FM_MARKER_ID.equals(item.music().platform())) {
+            // Retain ownership and queue ID, but consume each explicit pin once.
+            queue.addLast(item.withPriority(Priority.REGULAR));
+        }
+        lastPlayedUserToken.set(item.enqueuedBy().token());
+        return item;
+    }
+
+    public synchronized void markPlaybackFailed(MusicQueueItem item) {
+        if (appProperties.getQueue().isRetainPlaylist()) {
+            playbackRetryAt.put(musicKey(item.music()), System.currentTimeMillis() + PLAYBACK_RETRY_DELAY_MS);
+        }
+    }
+
+    public synchronized void clearPlaybackFailure(MusicQueueItem item) {
+        playbackRetryAt.remove(musicKey(item.music()));
+        // A failed attempt must not consume first-play priority.
+        if (appProperties.getQueue().isRetainPlaylist()) shuffleCycle.heard(item);
+    }
+
+    private static String musicKey(Music music) {
+        return ResourceKey.encode(music.platform(), music.id());
+    }
+
+    private boolean retryAllowed(Music music) {
+        return !appProperties.getQueue().isRetainPlaylist()
+                || playbackRetryAt.getOrDefault(musicKey(music), 0L) <= System.currentTimeMillis();
+    }
+
+    /**
+     * "完全"随机播放算法：在可用歌曲池中随机抽取
+     */
+    private MusicQueueItem pollNextTotalShuffle(List<MusicQueueItem> availableItems, Set<String> onlineUserTokens, boolean allowOffline) {
+        List<MusicQueueItem> pool;
+        if (allowOffline) {
+            pool = availableItems;
+        } else {
+            // FM 合成标记（__FM__）并非真实注册用户，需无条件放行，否则"加入队列"功能在默认离线过滤下永不命中
+            pool = availableItems.stream()
+                    .filter(item -> onlineUserTokens.contains(item.enqueuedBy().token())
+                            || FM_MARKER_USER_TOKEN.equals(item.enqueuedBy().token()))
+                    .toList();
+        }
+
+        if (pool.isEmpty()) {
+            // 没有任何在线用户点的歌可播（离线过滤把队里所有歌都滤掉了）→ 回退到全部可播项。
+            // 语义：在线优先，但"仅在线"不是"宁可不播"——否则只有离线用户的歌时播放器一直空转。
+            if (!allowOffline && !availableItems.isEmpty()) {
+                pool = availableItems;
+            } else {
+                return null;
+            }
+        }
+
+        shuffleCycle.prune(new ArrayList<>(queue));
+        return shuffleCycle.choose(pool, false);
+    }
+
+    /**
+     * "公平"随机播放算法：严格轮询 (Strict Round-Robin) + 在线优先 + 个人置顶优先
+     */
+    private MusicQueueItem pollNextFairShuffle(List<MusicQueueItem> availableItems, Set<String> onlineUserTokens, boolean allowOffline) {
+        // 1. 按用户分组
+        Map<String, List<MusicQueueItem>> userSongsMap = new HashMap<>();
+        for (MusicQueueItem item : availableItems) {
+            userSongsMap.computeIfAbsent(item.enqueuedBy().token(), k -> new ArrayList<>()).add(item);
+        }
+
+        List<String> allUserTokens = new ArrayList<>(userSongsMap.keySet());
+        
+        // 2. 筛选目标用户池
+        List<String> targetUserTokens;
+        if (allowOffline) {
+            // 允许离线：用户池为所有人，但依然保持“在线优先”的轮询感？
+            // 还是直接平权？通常公平随机下，允许离线意味着轮询不跳过离线人。
+            targetUserTokens = allUserTokens;
+        } else {
+            // 不允许离线：只从在线用户中轮询；FM 合成标记（__FM__）视为一个用户无条件放行
+            targetUserTokens = allUserTokens.stream()
+                    .filter(t -> onlineUserTokens.contains(t) || FM_MARKER_USER_TOKEN.equals(t))
+                    .collect(Collectors.toList());
+        }
+
+        if (targetUserTokens.isEmpty()) {
+            // 没有任何在线用户点的歌可播（离线过滤把队里所有用户都滤掉了）→ 回退到含离线用户的全部用户池。
+            // 语义：在线优先，但"仅在线"不是"宁可不播"——否则只有离线用户的歌时播放器一直空转。
+            if (!allowOffline && !allUserTokens.isEmpty()) {
+                targetUserTokens = new ArrayList<>(allUserTokens);
+            } else {
+                return null;
+            }
+        }
+
+        // 3. 严格轮询逻辑
+        Collections.sort(targetUserTokens);
+
+        String lastToken = lastPlayedUserToken.get();
+        int nextIndex = 0;
+
+        if (targetUserTokens.contains(lastToken)) {
+            int currentIndex = targetUserTokens.indexOf(lastToken);
+            nextIndex = (currentIndex + 1) % targetUserTokens.size();
+        } else {
+            // 寻找 Token 排序中紧随其后的用户
+            nextIndex = 0;
+            for (int i = 0; i < targetUserTokens.size(); i++) {
+                if (targetUserTokens.get(i).compareTo(lastToken) > 0) {
+                    nextIndex = i;
+                    break;
+                }
+            }
+        }
+
+        String selectedUserToken = targetUserTokens.get(nextIndex);
+        List<MusicQueueItem> userSongs = userSongsMap.get(selectedUserToken);
+
+        // 4. 检查是否有个人置顶
+        Optional<MusicQueueItem> userTop = userSongs.stream()
+                .filter(i -> i.priority() == Priority.USER_TOP)
+                .findFirst();
+
+        if (userTop.isPresent()) {
+            return userTop.get();
+        }
+
+        if (!isMemberShuffle(selectedUserToken)) {
+            return userSongs.getFirst();
+        }
+        shuffleCycle.prune(new ArrayList<>(queue));
+        return shuffleCycle.choose(userSongs, true);
+    }
+    
+    // ... (rest of methods)
+
+    public synchronized void setMemberShuffle(String token, boolean shuffle) {
+        if (isMemberToken(token)) memberShuffle.put(token, shuffle);
+    }
+
+    public synchronized boolean isMemberShuffle(String token) {
+        return memberShuffle.getOrDefault(token, true);
+    }
+
+    public synchronized Map<String, Boolean> getMemberShufflePreferences() {
+        return Map.copyOf(memberShuffle);
+    }
+
+    public synchronized void restoreMemberShufflePreferences(Map<String, Boolean> preferences) {
+        Map<String, Boolean> restored = new HashMap<>();
+        if (preferences != null) {
+            preferences.forEach((token, shuffle) -> {
+                if (isMemberToken(token) && shuffle != null) restored.put(token, shuffle);
+            });
+        }
+        memberShuffle.clear();
+        memberShuffle.putAll(restored);
+    }
+
+    public synchronized boolean reorder(String queueId, String beforeQueueId, String actorToken, PlayMode mode) {
+        if (!isMemberToken(actorToken) || mode == null) return false;
+        List<MusicQueueItem> reordered = new ArrayList<>(queue);
+        MusicQueueItem item = reordered.stream().filter(entry -> entry.queueId().equals(queueId))
+                .findFirst().orElse(null);
+        if (item == null || !isReorderable(item, actorToken, mode)) {
+            return false;
+        }
+        List<MusicQueueItem> owned = reordered.stream()
+                .filter(entry -> isReorderable(entry, actorToken, mode))
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (beforeQueueId != null && owned.stream().noneMatch(entry -> entry.queueId().equals(beforeQueueId))) return false;
+        if (Objects.equals(queueId, beforeQueueId)) return true;
+        owned.remove(item);
+        int targetIndex = beforeQueueId == null ? owned.size() : java.util.stream.IntStream.range(0, owned.size())
+                .filter(index -> owned.get(index).queueId().equals(beforeQueueId)).findFirst().orElseThrow();
+        owned.add(targetIndex, item);
+        Iterator<MusicQueueItem> replacement = owned.iterator();
+        // Pins/FM keep their slots; non-sequential modes also preserve other members' slots.
+        reordered.replaceAll(entry -> isReorderable(entry, actorToken, mode) ? replacement.next() : entry);
+        queue.clear();
+        queue.addAll(reordered);
+        return true;
+    }
+
+    private static boolean isReorderable(MusicQueueItem item, String actorToken, PlayMode mode) {
+        return isMemberToken(item.enqueuedBy().token()) && item.priority() == Priority.REGULAR
+                && !FM_MARKER_ID.equals(item.music().platform())
+                && (mode == PlayMode.SEQUENTIAL || actorToken.equals(item.enqueuedBy().token()));
+    }
+
+    public synchronized void restoreQueueOrder(List<MusicQueueItem> entries) {
+        queue.clear();
+        queue.addAll(entries);
+    }
+
+    private static boolean isMemberToken(String token) {
+        return token != null && !token.isBlank() && !"SYSTEM".equals(token)
+                && !"ADMIN".equals(token) && !token.startsWith("__");
+    }
+
+    public synchronized Set<String> getPlayedQueueIds() {
+        shuffleCycle.prune(new ArrayList<>(queue));
+        return shuffleCycle.heardSnapshot();
+    }
+
+    public synchronized void restorePlayedQueueIds(Set<String> ids) {
+        shuffleCycle.restoreHeard(ids);
+        shuffleCycle.prune(new ArrayList<>(queue));
+    }
+
+    private Optional<MusicQueueItem> findByQueueId(String queueId) {
+        return queue.stream()
+                .filter(item -> item.queueId().equals(queueId))
+                .findFirst();
+    }
+
+    /**
+     * 将播放完的歌曲加入历史记录
+     */
+    public void addToHistory(Music music) {
+        if (music == null) return;
+        synchronized (playHistory) {
+            playHistory.removeIf(m -> m.id().equals(music.id()) && m.platform().equals(music.platform()));
+            playHistory.add(0, music); // 加到最前面
+            if (playHistory.size() > appProperties.getQueue().getHistorySize()) {
+                playHistory.removeLast();
+            }
+        }
+    }
+
+    /**
+     * 清空队列和历史记录
+     */
+    public synchronized void clearAll() {
+        memberShuffle.clear();
+        shuffleCycle.clear();
+        playbackRetryAt.clear();
+        queue.clear();
+        playHistory.clear();
+        lastPlayedUserToken.set("");
+    }
+
+    public synchronized void clearPendingQueue() {
+        shuffleCycle.clear();
+        playbackRetryAt.clear();
+        queue.clear();
+    }
+
+    /** 确保队列中存在一个私人FM 合成标记项（幂等） */
+    public synchronized void ensureFmMarker() {
+        if (queue.size() >= appProperties.getQueue().getMaxSize()) return;
+        Music fmMusic = new Music(FM_MARKER_ID, "私人FM", List.of("私人FM"), 0L, FM_MARKER_ID, null, null);
+        if (isMusicInQueue(fmMusic)) return;
+        UserSummary fmUser = new UserSummary(FM_MARKER_USER_TOKEN, FM_MARKER_USER_TOKEN, "私人FM", false);
+        queue.addLast(new MusicQueueItem(UUID.randomUUID().toString(), fmMusic, fmUser, QueueItemStatus.READY, Priority.REGULAR));
+    }
+
+    /** 移除队列中的私人FM 合成标记项（幂等，用于总开关关闭/退出随机等对称清理） */
+    public synchronized void removeFmMarker() {
+        List<MusicQueueItem> toRemove = queue.stream()
+                .filter(item -> FM_MARKER_ID.equals(item.music().platform()))
+                .toList();
+        toRemove.forEach(queue::remove);
+        shuffleCycle.prune(new ArrayList<>(queue));
+    }
+
+    /** 队列中是否存在至少一个"可播放"项（READY 或 FAILED） */
+    public synchronized boolean hasPlayableItems(Map<String, QueueItemStatus> statusMap) {
+        return queue.stream()
+                .anyMatch(item -> {
+                    QueueItemStatus st = statusMap.getOrDefault(musicKey(item.music()), QueueItemStatus.PENDING);
+                    return retryAllowed(item.music()) && (st == QueueItemStatus.READY || st == QueueItemStatus.FAILED);
+                });
+    }
+
+    /** Apply a previously persisted claim while holding this queue's monitor. Stable IDs and order are preserved. */
+    synchronized void commitPlaylistClaim(List<MusicQueueItem> entries, String sourceToken, String targetToken) {
+        queue.clear();
+        queue.addAll(entries);
+        lastPlayedUserToken.compareAndSet(sourceToken, targetToken);
+        if (!Objects.equals(sourceToken, targetToken)) memberShuffle.remove(sourceToken);
+    }
+
+    public synchronized List<MusicQueueItem> getQueueSnapshot() {
+        return new ArrayList<>(queue);
+    }
+
+    public List<Music> getHistorySnapshot() {
+        synchronized (playHistory) {
+            return new ArrayList<>(playHistory);
+        }
+    }
+
+    /**
+     * 从持久化存储恢复队列和历史记录
+     */
+    public synchronized void restore(List<MusicQueueItem> loadedQueue, List<Music> loadedHistory) {
+        memberShuffle.clear();
+        shuffleCycle.clear();
+        playbackRetryAt.clear();
+        // Clear current
+        queue.clear();
+        playHistory.clear();
+        lastPlayedUserToken.set("");
+
+        // Restore Queue
+        if (loadedQueue != null) {
+            queue.addAll(loadedQueue);
+        }
+
+        // Restore History
+        if (loadedHistory != null) {
+            playHistory.addAll(loadedHistory);
+        }
+    }
+
+    private boolean isMusicInQueue(Music music) {
+        return queue.stream().anyMatch(item -> musicKey(item.music()).equals(musicKey(music)));
+    }
+
+    private boolean isReadyOrFailed(Map<String, QueueItemStatus> statusMap, MusicQueueItem item) {
+        QueueItemStatus status = statusMap.getOrDefault(musicKey(item.music()), QueueItemStatus.PENDING);
+        return retryAllowed(item.music()) && (status == QueueItemStatus.READY || status == QueueItemStatus.FAILED);
+    }
+
+    /**
+     * 当队列为空时，从历史记录随机取一首作为 AutoDJ
+     */
+    private MusicQueueItem pollFromHistory() {
+        if (playHistory.isEmpty()) {
+            return null;
+        }
+        List<Music> available;
+        synchronized (playHistory) {
+            available = playHistory.stream().filter(this::retryAllowed).toList();
+        }
+        if (available.isEmpty()) return null;
+        Music randomSong = available.get(new Random().nextInt(available.size()));
+
+        // 历史记录自动播放：REQ_BY 展示名显示"历史记录"而非 AutoDJ
+        UserSummary systemUser = new UserSummary("SYSTEM", "SYSTEM", "历史记录", false);
+
+        // 注意：历史记录出来的歌需要重新判断状态
+        return new MusicQueueItem(
+                UUID.randomUUID().toString(),
+                randomSong,
+                systemUser,
+                QueueItemStatus.PENDING
+        , org.thornex.musicparty.enums.Priority.REGULAR);
+    }
+}

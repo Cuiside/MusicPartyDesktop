@@ -1,0 +1,103 @@
+{
+  "name": "music-party-desktop",
+  "private": true,
+  "version": "0.9.7",
+  "description": "Music Party desktop client · Electron + Vue 3",
+  "author": "ThorNex",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k -s first \"npm:dev:web\" \"npm:dev:app\"",
+    "dev:web": "vite --port 5173 --strictPort",
+    "dev:app": "wait-on tcp:5173 && cross-env MP_DEV=1 node scripts/start.cjs",
+    "build": "vite build",
+    "start": "node scripts/start.cjs",
+    "electron:install": "node node_modules/electron/install.js",
+    "shot": "node scripts/shot.cjs",
+    "icon": "node scripts/pack-icon.cjs",
+    "test": "node scripts/launcher-smoke.cjs && node scripts/admin-api-smoke.cjs",
+    "test:launcher": "node scripts/launcher-smoke.cjs",
+    "test:launcher:real": "node scripts/launcher-fix-smoke.cjs",
+    "release:check": "node scripts/check-public-release.cjs",
+    "release:check-candidate": "node scripts/check-candidate.cjs",
+    "release:check-history": "node scripts/check-history.cjs",
+    "resources:prepare": "node scripts/prepare-local-resources.cjs",
+    "pack": "node scripts/pack.cjs --win --variant local-server",
+    "pack:dir": "node scripts/pack.cjs --dir --variant local-server",
+    "pack:win": "node scripts/pack.cjs --win --variant local-server",
+    "pack:remote": "node scripts/pack.cjs --win --variant remote",
+    "pack:remote:dir": "node scripts/pack.cjs --dir --variant remote",
+    "pack:local": "node scripts/pack.cjs --win --variant local-server",
+    "pack:local:dir": "node scripts/pack.cjs --dir --variant local-server",
+    "pack:verify": "node scripts/pack-shot.cjs --variant remote",
+    "pack:verify:local": "node scripts/pack-shot.cjs --variant local-server",
+    "pack:verify:all": "node scripts/pack-shot.cjs --variant remote && node scripts/pack-shot.cjs --variant local-server",
+    "pack:e2e": "node scripts/pack-e2e.cjs --variant remote && node scripts/pack-e2e.cjs --variant local-server",
+    "pack:e2e:remote": "node scripts/pack-e2e.cjs --variant remote",
+    "pack:e2e:local": "node scripts/pack-e2e.cjs --variant local-server"
+  },
+  "dependencies": {
+    "@fontsource/space-grotesk": "^5.3.0",
+    "@stomp/stompjs": "^7.5.0",
+    "@vueuse/core": "^15.0.0",
+    "axios": "^1.21.0",
+    "dayjs": "^1.11.23",
+    "lucide-vue-next": "^0.577.0",
+    "pinia": "^4.1.0",
+    "vue": "^3.5.45"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "concurrently": "^10.0.7",
+    "cross-env": "^10.1.0",
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0",
+    "vite": "^8.3.6",
+    "wait-on": "^9.5.1"
+  },
+  "build": {
+    "appId": "com.musicparty.desktop",
+    "productName": "Music Party",
+    "copyright": "Copyright © 2026 ThorNex",
+    "directories": {
+      "output": "release-new/remote",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "asar": true,
+    "npmRebuild": false,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "MusicParty-${version}-remote-win-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "MusicParty-${version}-remote-portable-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "MusicParty-${version}-remote-setup-${arch}.${ext}"
+    }
+  }
+}

@@ -1,0 +1,125 @@
+package org.thornex.musicparty.util;
+
+import org.springframework.core.codec.DecodingException;
+import org.springframework.http.MediaType;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.thornex.musicparty.dto.Music;
+import org.thornex.musicparty.exception.ApiRequestException;
+import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.time.Duration;
+import java.util.List;
+
+public class BilibiliApiUtils {
+
+    // 内部记录类，用于一次性返回 CID 和 Music 详情
+    public record BilibiliVideoInfo(String cid, Music music) {}
+
+    /**
+     * 封面/头像统一转 https。B站各 API 返回的图片 URL 格式不一致：
+     * search 接口返回协议相对 {@code //i0.hdslb.com/...}，view/favorite 接口返回显式 {@code http://...}。
+     * https 页面上 {@code http://} 子资源会被浏览器/WebView 当作混合内容拦截 → 封面加载不出来，
+     * 因此统一升级为 https（与网易云源 upgradeToHttps 的做法一致）。
+     */
+    public static String normalizeCoverUrl(String url) {
+        if (url == null || url.isEmpty()) return url;
+        if (url.startsWith("//")) return "https:" + url;
+        if (url.startsWith("http://")) return "https://" + url.substring("http://".length());
+        return url;
+    }
+
+    public static long durationToMillis(String durationStr) {
+        if (durationStr == null || durationStr.isEmpty()) return 0;
+        String[] parts = durationStr.split(":");
+        long millis = 0;
+        try {
+            if (parts.length == 2) millis = (Long.parseLong(parts[0]) * 60 + Long.parseLong(parts[1])) * 1000;
+            else if (parts.length == 3) millis = (Long.parseLong(parts[0]) * 3600 + Long.parseLong(parts[1]) * 60 + Long.parseLong(parts[2])) * 1000;
+        } catch (NumberFormatException e) { return 0; }
+        return millis;
+    }
+
+    /**
+     * @param cookie 完整 Cookie 头（含 SESSDATA、buvid3、bili_ticket 等）
+     */
+    private static WebClient.RequestHeadersSpec<?> buildRequest(String uri, String cookie, WebClient webClient) {
+        return webClient.get().uri(uri)
+                .header("Cookie", cookie)
+                .header("Referer", "https://www.bilibili.com/");
+    }
+
+    public static Mono<String> getVideoCid(String bvid, WebClient webClient, String baseUrl, String cookie) {
+        return getVideoInfo(bvid, webClient, baseUrl, cookie).map(BilibiliVideoInfo::cid);
+    }
+
+    public static Mono<Music> getVideoDetails(String bvid, WebClient webClient, String baseUrl, String cookie) {
+        return getVideoInfo(bvid, webClient, baseUrl, cookie).map(BilibiliVideoInfo::music);
+    }
+
+    /**
+     * 🟢 核心方法：一次请求获取 CID 和 视频详情
+     */
+    public static Mono<BilibiliVideoInfo> getVideoInfo(String bvid, WebClient webClient, String baseUrl, String cookie) {
+        return withRiskControlHandling(buildRequest(baseUrl + "/x/web-interface/view?bvid=" + bvid, cookie, webClient)
+                .retrieve()
+                .bodyToMono(JsonNode.class))
+                .handle((jsonNode, sink) -> {
+                    int code = jsonNode.path("code").asInt();
+                    // -101 = 账号未登录：配置的 Cookie 已经失效。
+                    if (code == -101) {
+                        sink.error(org.thornex.musicparty.service.api.SourceAuth.invalid("Bilibili"));
+                        return;
+                    }
+                    if (code != 0) {
+                        sink.error(new ApiRequestException("Could not get Bilibili video info: " + jsonNode.path("message").asText()));
+                        return;
+                    }
+                    JsonNode data = jsonNode.path("data");
+                    String cid = data.path("cid").asText();
+
+                    // 获取时长（API 返回的是秒）
+                    long durationMs = data.path("duration").asLong() * 1000;
+
+                    Music music = new Music(
+                            bvid,
+                            data.path("title").asText(),
+                            List.of(data.path("owner").path("name").asText()),
+                            durationMs,
+                            "bilibili",
+                            normalizeCoverUrl(data.path("pic").asText()),
+                            null
+                    );
+
+                    sink.next(new BilibiliVideoInfo(cid, music));
+                });
+    }
+
+    /**
+     * B 站风控（HTTP 412/403 挑战页、或挑战页正文非 JSON）重试一次并转成友好错误。
+     * view 接口此前没有这层处理，单次 412 会直接以
+     * "412 Precondition Failed from GET ..." 的形式冒到用户提示里。
+     */
+    public static <T> Mono<T> withRiskControlHandling(Mono<T> source) {
+        return source
+                .retryWhen(Retry.backoff(1, Duration.ofMillis(800))
+                        .filter(BilibiliApiUtils::isRiskControl)
+                        .onRetryExhaustedThrow((spec, signal) -> signal.failure()))
+                .onErrorMap(BilibiliApiUtils::isRiskControl,
+                        error -> new ApiRequestException("B 站风控拦截，请稍后重试"));
+    }
+
+    static boolean isRiskControl(Throwable error) {
+        if (error instanceof WebClientResponseException response) {
+            int status = response.getStatusCode().value();
+            if (status == 412 || status == 403) return true;
+            // WebClient wraps unsupported HTML decoding in a response exception even for HTTP 200.
+            return response.getStatusCode().is2xxSuccessful()
+                    && response.getHeaders().getContentType() != null
+                    && MediaType.TEXT_HTML.isCompatibleWith(response.getHeaders().getContentType());
+        }
+        return error instanceof DecodingException;
+    }
+}

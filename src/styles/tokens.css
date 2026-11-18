@@ -1,0 +1,89 @@
+/* Music Party desktop — design tokens.
+   Derived from desktop-app-ui-prompt.md: yellow shell, white canvas, black ink,
+   sharp corners, compact density, hairlines, one light. */
+
+:root {
+  /* surfaces */
+  --shell: #ffcd38;
+  --shell-alt: #f6c42a;
+  --shell-line: #e0ae00;
+  --canvas: #fcfcfd;
+  --surface: #f6f4ee;
+  --surface-strong: #efebe1;
+
+  /* ink */
+  --ink: #000000;
+  --ink-2: #141414;
+  --ink-3: #1a1a1a;
+  --muted: rgba(20, 20, 20, 0.62);
+  --muted-2: rgba(20, 20, 20, 0.42);
+  --inverse: #141314;
+  --inverse-text: #fcfcfd;
+
+  /* accent & action */
+  --accent: #ffcd38;
+  --action: #141414;
+  --action-text: #fcfcfd;
+
+  /* lines */
+  --hairline: #e0ae00;
+  --hairline-soft: rgba(224, 174, 0, 0.5);
+  --line: #e8e2d6;
+  --line-strong: #d8d1c2;
+
+  --focus: #141414;
+  --danger: #a4262c;
+
+  /* type */
+  --font: 'Space Grotesk', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC',
+    'Noto Sans SC', system-ui, sans-serif;
+  --font-mono: 'Space Grotesk', 'Cascadia Mono', Consolas, monospace;
+
+  --fs-hero: 36px;
+  --fs-display: 36px;
+  --fs-display-sm: 32px;
+  --fs-h1: 24px;
+  --fs-h2: 20px;
+  --fs-h3: 16px;
+  --fs-body: 14px;
+  --fs-data: 13px;
+  --fs-label: 11px;
+  --fs-micro: 10px;
+
+  /* geometry */
+  --h-titlebar: 48px;
+  --h-command: 64px;
+  --h-status: 32px;
+  --h-row: 40px;
+  --h-control: 32px;
+  --w-nav: 72px;
+  --w-sidebar: 264px;
+  --w-inspector: 320px;
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+  --s10: 40px;
+  --s12: 48px;
+
+  /* motion */
+  --dur-1: 110ms;
+  --dur-2: 180ms;
+  --dur-3: 280ms;
+  --dur-4: 420ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (max-width: 1200px) {
+  :root {
+    --fs-hero: 32px;
+    --fs-display: 32px;
+    --w-sidebar: 240px;
+    --w-inspector: 292px;
+  }
+}

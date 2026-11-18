@@ -1,0 +1,1348 @@
+package org.thornex.musicparty.service;
+
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.thornex.musicparty.config.AppProperties;
+import org.thornex.musicparty.dto.*;
+import org.thornex.musicparty.dto.SettingsSnapshot;
+import org.thornex.musicparty.dto.PrivateDjSegment;
+import org.thornex.musicparty.enums.PlayerAction;
+import org.thornex.musicparty.enums.PlayMode;
+import org.thornex.musicparty.enums.QueueItemStatus;
+import org.thornex.musicparty.enums.TopResult;
+import org.thornex.musicparty.event.*;
+import org.thornex.musicparty.exception.ApiRequestException;
+import org.thornex.musicparty.media.MediaDeliveryService;
+import org.thornex.musicparty.source.ResourceKey;
+import org.thornex.musicparty.source.SourceRegistry;
+import reactor.core.scheduler.Schedulers;
+import org.thornex.musicparty.service.stream.LiveStreamService;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+@Service
+@Slf4j
+public class MusicPlayerService {
+
+    private final SourceRegistry sourceRegistry;
+    private final UserService userService;
+    private final MediaDeliveryService mediaDeliveryService;
+    // ChatService dependency removed to break circular reference
+    private final LiveStreamService liveStreamService;
+
+    // --- Refactored Dependencies ---
+    private final MusicQueueManager queueManager;
+    private final ApplicationEventPublisher eventPublisher;
+    private final AppProperties appProperties;
+    private final PrivateDjService privateDjService;
+
+    // --- Player State ---
+    private final AtomicReference<PlayableMusic> currentMusic = new AtomicReference<>(null);
+    private String playbackId;
+    private final AtomicReference<String> currentEnqueuerId = new AtomicReference<>(null);
+    private final AtomicReference<String> currentEnqueuerName = new AtomicReference<>(null);
+
+    // 核心计时逻辑
+    private final AtomicLong positionAnchor = new AtomicLong(0); // 上一次更新状态时的进度(ms)
+    private final AtomicLong timestampAnchor = new AtomicLong(0); // 上一次更新状态时的系统时间(ms)
+    /** 每次房间级 seek 自增，客户端据此重锚本地时钟。 */
+    private final AtomicLong seekNonce = new AtomicLong(0);
+    /** 每个音源最近一次「Cookie 失效」提示的时间，避免连续跳过时刷屏。 */
+    private final java.util.Map<String, Long> credentialHintAt = new java.util.concurrent.ConcurrentHashMap<>();
+
+
+    private final AtomicReference<PlayMode> playMode = new AtomicReference<>(PlayMode.SEQUENTIAL);
+    private final AtomicBoolean allowOfflineShuffle;
+    private final AtomicBoolean isPaused = new AtomicBoolean(false);
+    private final AtomicBoolean isPauseLocked = new AtomicBoolean(false);
+    private final AtomicBoolean isSkipLocked = new AtomicBoolean(false);
+    private final AtomicBoolean isPlayModeLocked = new AtomicBoolean(false);
+    private final AtomicBoolean isLoading = new AtomicBoolean(false);
+    private final AtomicBoolean isStreamActive = new AtomicBoolean(false);
+
+    // 投票切歌状态
+    private final AtomicBoolean isVoteSkipEnabled = new AtomicBoolean(false);
+    private final AtomicReference<Double> voteSkipThreshold = new AtomicReference<>(0.5);
+    private final AtomicReference<Integer> voteSkipWaitTime = new AtomicReference<>(15);
+    private final Set<String> skipVotes = ConcurrentHashMap.newKeySet();
+
+    private final Map<String, Object> likeLock = new HashMap<>();
+    private Set<String> currentLikedUserIds;
+    private List<Long> currentLikeMarkers;
+
+    private final AtomicLong lastControlTimestamp = new AtomicLong(0);
+    private static final long GLOBAL_COOLDOWN_MS = 1000;
+    private static final long IDLE_RESET_TIMEOUT_MS = Duration.ofMinutes(20).toMillis();
+
+    private final AtomicLong playHeadVersion = new AtomicLong(0);
+
+    // 私人FM/DJ 播放失败指数退避（5s→10s→20s→40s→80s，封顶 80s）
+    private final AtomicLong fmDjRetryAt = new AtomicLong(0);
+    private final AtomicInteger fmDjFailCount = new AtomicInteger(0);
+    private static final long FM_DJ_MAX_BACKOFF_MS = 80_000L;
+
+    // 当前播放段是否为 DJ 语音（语音段播完不进历史记录）
+    private final AtomicBoolean currentIsVoice = new AtomicBoolean(false);
+
+    // Ownership overrides apply only to the currently pending playback request, never future enqueues.
+    private long claimedPlaybackVersion = -1;
+    private final Map<String, UserSummary> claimedPlaybackOwners = new HashMap<>();
+
+    public MusicPlayerService(SourceRegistry sourceRegistry, UserService userService,
+                              MediaDeliveryService mediaDeliveryService,
+                              LiveStreamService liveStreamService,
+                              MusicQueueManager queueManager,
+                              ApplicationEventPublisher eventPublisher,
+                              AppProperties appProperties,
+                              PrivateDjService privateDjService) {
+        this.sourceRegistry = sourceRegistry;
+        this.userService = userService;
+        this.mediaDeliveryService = mediaDeliveryService;
+        this.liveStreamService = liveStreamService;
+        this.queueManager = queueManager;
+        this.eventPublisher = eventPublisher;
+        this.appProperties = appProperties;
+        this.privateDjService = privateDjService;
+        this.allowOfflineShuffle = new AtomicBoolean(false);
+        this.currentLikedUserIds = ConcurrentHashMap.newKeySet();
+        this.currentLikeMarkers = new CopyOnWriteArrayList<>();
+    }
+
+    @PostConstruct
+    public void init() {
+        log.info("MusicPlayerService initialized with {} sources", sourceRegistry.descriptors().size());
+        
+        // 从配置初始化投票参数
+        AppProperties.PlayerConfig playerConfig = appProperties.getPlayer();
+        isVoteSkipEnabled.set(playerConfig.isVoteSkipEnabled());
+        voteSkipThreshold.set(playerConfig.getVoteSkipThreshold());
+        voteSkipWaitTime.set(playerConfig.getVoteSkipWaitTime());
+    }
+
+    @Scheduled(fixedRate = 1000)
+    public synchronized void playerLoop() {
+        if (isPaused.get()) {
+            return;
+        }
+
+        PlayableMusic music = currentMusic.get();
+
+        if (music != null) {
+            long currentPos = calculateCurrentPosition();
+
+            // 检查是否播放结束
+            if (currentPos >= music.duration() && music.duration() > 0) {
+                log.info("Song finished: {}", music.name());
+
+                if (playMode.get() == PlayMode.REPEAT_ONE && !currentIsVoice.get()) {
+                    restartCurrentSong(music);
+                    return;
+                }
+
+                // DJ 语音段不进历史记录（spec/plan 明确要求；否则空队时会从历史取到语音并被当作真实网易云歌曲导致 NPE）
+                if (!currentIsVoice.get()) {
+                    Music finishedMusic = new Music(
+                            music.id(),
+                            music.name(),
+                            music.artists(),
+                            music.duration(),
+                            music.platform(),
+                            music.coverUrl(),
+                            music.externalUrl()
+                    );
+                    queueManager.addToHistory(finishedMusic);
+                }
+
+                // 清空当前，触发下一首
+                currentMusic.set(null);
+                playbackId = null;
+                playNextInQueue();
+            }
+        } else {
+            if (userService.getOnlineUserSummaries().isEmpty() && !isStreamActive.get()) {
+                return;
+            }
+            if (System.currentTimeMillis() >= fmDjRetryAt.get()
+                    && (shouldPlayPrivateFmDj() || !queueManager.getQueueSnapshot().isEmpty())) {
+                playNextInQueue();
+            }
+        }
+    }
+
+    private boolean hasAuthorization(String source, String expected) {
+        try {
+            return sourceRegistry.isEnabled(source)
+                    && Objects.equals(expected, mediaDeliveryService.authorizationScope(source));
+        } catch (ApiRequestException error) {
+            return false;
+        }
+    }
+
+    private void restartCurrentSong(PlayableMusic previous) {
+        if (isLoading.get()) return;
+        if ("VOICE".equals(previous.kind())) {
+            playbackId = UUID.randomUUID().toString();
+            positionAnchor.set(0);
+            timestampAnchor.set(System.currentTimeMillis());
+            broadcastFullPlayerState();
+            return;
+        }
+        long version = playHeadVersion.incrementAndGet();
+        isLoading.set(true);
+        Mono.defer(() -> {
+                    String authorization = mediaDeliveryService.authorizationScope(previous.platform());
+                    return mediaDeliveryService.getPlayableMusic(previous.platform(), previous.id())
+                            .map(prepared -> reactor.util.function.Tuples.of(authorization, prepared));
+                })
+                .subscribeOn(Schedulers.boundedElastic())
+                .timeout(Duration.ofSeconds(10))
+                .subscribe(result -> {
+                    synchronized (this) {
+                        if (playHeadVersion.get() != version) return;
+                        PlayableMusic prepared = result.getT2();
+                        if (!hasAuthorization(prepared.platform(), result.getT1())) {
+                            currentMusic.set(null);
+                            playbackId = null;
+                            isLoading.set(false);
+                            playNextInQueue();
+                            return;
+                        }
+                        currentMusic.set(prepared);
+                        playbackId = UUID.randomUUID().toString();
+                        positionAnchor.set(0);
+                        timestampAnchor.set(System.currentTimeMillis());
+                        isLoading.set(false);
+                        broadcastFullPlayerState();
+                    }
+                }, error -> {
+                    synchronized (this) {
+                        if (playHeadVersion.get() != version) return;
+                        currentMusic.set(null);
+                        playbackId = null;
+                        isLoading.set(false);
+                        queueManager.getQueueSnapshot().stream()
+                                .filter(item -> ResourceKey.of(item.music()).equals(ResourceKey.of(previous)))
+                                .forEach(queueManager::markPlaybackFailed);
+                        playNextInQueue();
+                    }
+                });
+    }
+
+    private synchronized void playNextInQueue() {
+        if (currentMusic.get() != null || isLoading.get()) {
+            return;
+        }
+
+        // 加入队列功能：按条件同步 FM 标记（SHUFFLE + 模式非关闭 + 加入队列且非托管 → 在队，否则移除）
+        syncFmMarker();
+
+        // 播放源决策：托管 > (队列有有效歌曲则队列) > 填充空白
+        if (shouldPlayPrivateFmDj()) {
+            playFmDjNext();
+            return;
+        }
+
+        Map<String, QueueItemStatus> statusMap = buildStatusMap();
+
+        Set<String> onlineUserTokens = userService.getRecentlyActiveUserTokens();
+
+        MusicQueueItem nextItem = queueManager.pollNext(playMode.get(), allowOfflineShuffle.get(), statusMap, onlineUserTokens);
+
+        if (isFmMarker(nextItem)) {
+            playFmMarkerNext(nextItem);
+            return;
+        }
+        if (nextItem == null) {
+            if (isLoading.get()) {
+                isLoading.set(false);
+            }
+            broadcastFullPlayerState();
+            return;
+        }
+
+        if (statusMap.get(ResourceKey.encode(nextItem.music().platform(), nextItem.music().id())) == QueueItemStatus.FAILED) {
+            queueManager.markPlaybackFailed(nextItem);
+            if (sourceRegistry.isEnabled(nextItem.music().platform())) {
+                Mono.fromRunnable(() -> mediaDeliveryService.prefetch(nextItem.music()))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribe(null, error -> log.warn("Media preparation retry failed: {}", error.getMessage()));
+            }
+            log.warn("Skipping failed song: {}", nextItem.music().name());
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.ERROR_LOAD, "SYSTEM", nextItem.music().name()));
+            playNextInQueue();
+            return;
+        }
+
+        // 增加版本号，这表示"开始一次新的播放尝试"
+        long currentVersion = playHeadVersion.incrementAndGet();
+        isLoading.set(true);
+        broadcastFullPlayerState();
+        isPaused.set(false);
+
+        log.info("Playing next: {}", nextItem.music().name());
+
+        try {
+            String authorization = mediaDeliveryService.authorizationScope(nextItem.music().platform());
+            Mono.defer(() -> mediaDeliveryService.getPlayableMusic(nextItem.music().platform(), nextItem.music().id()))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .timeout(Duration.ofSeconds(10))
+                    .subscribe(
+                            playableMusic -> {
+                                // 检查版本号是否匹配
+                                // 如果在请求期间执行了 skip/stop，版本号会变，这里就应该丢弃结果
+                                synchronized (this) {
+                                    if (playHeadVersion.get() == currentVersion) {
+                                        if (!hasAuthorization(playableMusic.platform(), authorization)) {
+                                            queueManager.markPlaybackFailed(nextItem);
+                                            isLoading.set(false);
+                                            playNextInQueue();
+                                            return;
+                                        }
+                                        queueManager.clearPlaybackFailure(nextItem);
+                                        applyNewSong(playableMusic, nextItem);
+                                    } else {
+                                        log.info("Discarded stale play result for {}", nextItem.music().name());
+                                    }
+                                }
+                            },
+                            error -> {
+                        synchronized (this) {
+                            if (playHeadVersion.get() != currentVersion) return;
+                            queueManager.markPlaybackFailed(nextItem);
+                            log.error("Play failed for {}: {}", nextItem.music().name(), error.getMessage());
+                            // 失败原因写进那条「加载失败」消息里：它会进聊天历史，便于事后排查。
+                            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR,
+                                    PlayerAction.ERROR_LOAD, "SYSTEM", describePlaybackFailure(nextItem.music(), error)));
+                            publishCredentialHint(nextItem.music().platform(), error);
+                            isLoading.set(false);
+                            broadcastFullPlayerState();
+                            playNextInQueue();
+                        }
+                    });
+        } catch (Exception e) {
+            queueManager.markPlaybackFailed(nextItem);
+            log.error("Unexpected error in playNextInQueue", e);
+            isLoading.set(false);
+            broadcastFullPlayerState();
+        }
+    }
+
+    /** 播放失败的持久化描述：歌名 + 音源 + 原因，写进聊天历史便于排查。 */
+    private static String describePlaybackFailure(Music music, Throwable error) {
+        String reason = org.thornex.musicparty.service.api.SourceAuth.userMessage(
+                error == null ? null : error.getMessage());
+        if (reason == null || reason.isBlank()) return music.name() + "（" + music.platform() + "）";
+        return music.name() + "（" + music.platform() + "：" + reason + "）";
+    }
+
+    /** Cookie 失效、会员/版权受限等可操作原因给房间一条提示；同一音源 30 秒内只提示一次。 */
+    private void publishCredentialHint(String platform, Throwable error) {
+        String message = error == null ? null : error.getMessage();
+        if (message == null) return;
+        boolean actionable = message.startsWith(org.thornex.musicparty.service.api.SourceAuth.CODE)
+                || message.startsWith("MEDIA_FORBIDDEN");
+        if (!actionable) return;
+        long now = System.currentTimeMillis();
+        Long previous = credentialHintAt.get(platform);
+        if (previous != null && now - previous < 30_000) return;
+        credentialHintAt.put(platform, now);
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR,
+                PlayerAction.SYSTEM_MESSAGE, "SYSTEM", org.thornex.musicparty.service.api.SourceAuth.userMessage(message)));
+    }
+
+    /** 播放源决策：托管 > (队列有有效歌曲则队列) > 填充空白 */
+    boolean shouldPlayPrivateFmDj() {
+        AppProperties.PrivateDjConfig c = appProperties.getPrivateDj();
+        if ("OFF".equals(c.getMode()) || !privateDjService.supportsMode(c.getMode())) return false;
+        if (c.isCustodyEnabled()) return true;
+        if (c.isFillBlankEnabled()) {
+            return !queueManager.hasPlayableItems(buildStatusMap());
+        }
+        return false;
+    }
+
+    /** 从私人FM/DJ 内容提供器取下一段并播放（托管 / 填充空白共用） */
+    private void playFmDjNext() {
+        long version = playHeadVersion.incrementAndGet();
+        isLoading.set(true);
+        broadcastFullPlayerState();
+        privateDjService.nextSegment()
+                .subscribeOn(Schedulers.boundedElastic())
+                .timeout(Duration.ofSeconds(15))
+                .subscribe(
+                        segment -> {
+                            if (playHeadVersion.get() != version) return;
+                            loadFmDjPlayable(segment, version, false);
+                        },
+                        error -> handleFmDjError(version, error));
+    }
+
+    /** FM 标记被选中 → 强制取私人FM 段播放 */
+    private void playFmMarkerNext(MusicQueueItem marker) {
+        // 选中即移除（pollNext），这里立刻补回，保证"私人FM"在播放期间也常驻队列可见
+        syncFmMarker();
+        long version = playHeadVersion.incrementAndGet();
+        isLoading.set(true);
+        broadcastFullPlayerState();
+        privateDjService.nextFmSegment()
+                .subscribeOn(Schedulers.boundedElastic())
+                .timeout(Duration.ofSeconds(15))
+                .subscribe(
+                        segment -> {
+                            if (playHeadVersion.get() != version) return;
+                            loadFmDjPlayable(segment, version, true);
+                        },
+                        error -> handleFmDjError(version, error));
+    }
+
+    private boolean isFmMarker(MusicQueueItem item) {
+        return item != null && MusicQueueManager.FM_MARKER_ID.equals(item.music().platform());
+    }
+
+    /**
+     * 加入队列功能：SHUFFLE + 模式非关闭(OFF) + 加入队列且非托管时确保 FM 标记在队；
+     * 任一条件不满足时移除标记（对称清理，防止陈旧标记在 SEQUENTIAL 等路径被选中触发 FM 播放）。
+     */
+    void syncFmMarker() {
+        AppProperties.PrivateDjConfig c = appProperties.getPrivateDj();
+        boolean shouldPresent = privateDjService.supportsMode(c.getMode()) && !"OFF".equals(c.getMode()) && c.isJoinQueueEnabled()
+                && !c.isCustodyEnabled() && (playMode.get() == PlayMode.SHUFFLE || playMode.get() == PlayMode.ROUND_ROBIN);
+        if (shouldPresent) {
+            queueManager.ensureFmMarker();
+        } else {
+            queueManager.removeFmMarker();
+        }
+    }
+
+    // ---- 测试辅助（仅测试使用）----
+    void setPlayModeForTest(PlayMode mode) { playMode.set(mode); }
+    void syncFmMarkerForTest() { syncFmMarker(); }
+    void playFmMarkerNextForTest(MusicQueueItem marker) { playFmMarkerNext(marker); }
+    void setPositionForTest(long positionMs) { positionAnchor.set(positionMs); }
+    void applyFmDjSegmentForTest(PlayableMusic music, PrivateDjSegment segment) { applyFmDjSegment(music, segment, false); }
+    void setPausedForTest(boolean paused) { isPaused.set(paused); }
+
+    private boolean hasRecommendationAuthorization(String expected) {
+        try {
+            return privateDjService.isAvailable()
+                    && Objects.equals(expected, privateDjService.authorizationScope());
+        } catch (ApiRequestException error) {
+            return false;
+        }
+    }
+
+    private void loadFmDjPlayable(PrivateDjSegment segment, long version, boolean forceFm) {
+        String recommendationScope;
+        try { recommendationScope = privateDjService.authorizationScope(); }
+        catch (Exception error) { handleFmDjError(version, error); return; }
+        Mono.defer(() -> privateDjService.getPlayable(segment))
+                .subscribeOn(Schedulers.boundedElastic())
+                .timeout(Duration.ofSeconds(10)).subscribe(
+                pm -> {
+                    synchronized (this) {
+                        if (playHeadVersion.get() != version) return;
+                        if (!hasRecommendationAuthorization(recommendationScope)) {
+                            handleFmDjError(version, new ApiRequestException("RECOMMENDATIONS_CHANGED: 推荐音源或凭据已变化"));
+                            return;
+                        }
+                        applyFmDjSegment(pm, segment, forceFm);
+                    }
+                },
+                error -> handleFmDjError(version, error));
+    }
+
+    private synchronized void applyFmDjSegment(PlayableMusic music, PrivateDjSegment segment, boolean forceFm) {
+        currentLikedUserIds.clear();
+        currentLikeMarkers.clear();
+        skipVotes.clear();
+        boolean voice = segment instanceof PrivateDjSegment.Voice;
+        String kind = voice ? "VOICE" : "SONG";
+        currentMusic.set(kind.equals(music.kind()) ? music : new PlayableMusic(music.id(), music.name(), music.artists(), music.duration(), music.platform(),
+                music.url(), music.coverUrl(), kind, music.externalUrl()));
+        playbackId = UUID.randomUUID().toString();
+        currentIsVoice.set(voice);
+        currentEnqueuerId.set(MusicQueueManager.FM_MARKER_USER_TOKEN);
+        boolean djMode = "DJ".equals(appProperties.getPrivateDj().getMode());
+        currentEnqueuerName.set(forceFm ? "私人FM" : (djMode ? "私人DJ" : "私人FM"));
+        positionAnchor.set(0);
+        timestampAnchor.set(System.currentTimeMillis());
+        isPaused.set(false);
+        isLoading.set(false);
+        fmDjFailCount.set(0);
+        fmDjRetryAt.set(0);
+
+        if (segment instanceof PrivateDjSegment.Song s) {
+            queueManager.addToHistory(new Music(s.songId(), s.name(), s.artists(),
+                    s.durationMs(), music.platform(), s.coverUrl(), music.externalUrl()));
+        }
+
+        log.info("Now playing (private {}): {}", djMode ? "DJ" : "FM", music.name());
+        broadcastFullPlayerState();
+        broadcastQueueUpdate();
+        eventPublisher.publishEvent(new SystemMessageEvent(this,
+                SystemMessageEvent.Level.INFO, PlayerAction.PLAY_START, "__FM__", music.name()));
+    }
+
+    private void handleFmDjError(long version, Throwable error) {
+        if (playHeadVersion.get() != version) return;
+        log.warn("Private FM/DJ segment failed: {}", error instanceof ApiRequestException ? error.getMessage() : "upstream unavailable");
+        int fails = fmDjFailCount.incrementAndGet();
+        long backoff = Math.min(5_000L << Math.min(fails - 1, 4), FM_DJ_MAX_BACKOFF_MS);
+        fmDjRetryAt.set(System.currentTimeMillis() + backoff);
+        isLoading.set(false);
+        broadcastFullPlayerState();
+        eventPublisher.publishEvent(new SystemMessageEvent(this,
+                SystemMessageEvent.Level.ERROR, PlayerAction.SYSTEM_MESSAGE, "SYSTEM",
+                error instanceof ApiRequestException ? "私人FM/DJ: " + error.getMessage() : "私人FM/DJ 获取失败，稍后自动重试"));
+    }
+
+    private long calculateCurrentPosition() {
+        if (currentMusic.get() == null) return 0;
+        if (isPaused.get()) {
+            return positionAnchor.get();
+        } else {
+            long now = System.currentTimeMillis();
+            long elapsed = now - timestampAnchor.get();
+            return positionAnchor.get() + elapsed;
+        }
+    }
+
+    private synchronized void applyNewSong(PlayableMusic music, MusicQueueItem queueItem) {
+        if (claimedPlaybackVersion == playHeadVersion.get()) {
+            UserSummary claimed = claimedPlaybackOwners.get(queueItem.enqueuedBy().token());
+            if (claimed != null) queueItem = new MusicQueueItem(queueItem.queueId(), queueItem.music(), claimed, queueItem.status(), queueItem.priority());
+        }
+        queueItem = queueManager.getItem(queueItem.queueId()).orElse(queueItem);
+        currentLikedUserIds.clear();
+        currentLikeMarkers.clear();
+        skipVotes.clear(); // 切歌时清空投票
+
+        // 重置计时器
+        currentMusic.set(music);
+        playbackId = UUID.randomUUID().toString();
+        currentIsVoice.set(false);
+        currentEnqueuerId.set(queueItem.enqueuedBy().token());
+        currentEnqueuerName.set(queueItem.enqueuedBy().name());
+
+        positionAnchor.set(0);
+        timestampAnchor.set(System.currentTimeMillis());
+        isPaused.set(false);
+
+        log.info("Now playing: {}", music.name());
+        isLoading.set(false);
+        broadcastFullPlayerState();
+        broadcastQueueUpdate();
+
+        // 发布开始播放事件 (用于聊天栏展示)
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO, PlayerAction.PLAY_START, queueItem.enqueuedBy().token(), queueItem.enqueuedBy().name(), music.name()));
+    }
+
+    synchronized void commitPlaylistClaim(String sourceToken, UserSummary member) {
+        long version = playHeadVersion.get();
+        if (claimedPlaybackVersion != version) {
+            claimedPlaybackOwners.clear();
+            claimedPlaybackVersion = version;
+        }
+        claimedPlaybackOwners.replaceAll((token, owner) -> owner.token().equals(member.token()) ? member : owner);
+        claimedPlaybackOwners.put(sourceToken, member);
+        if (currentEnqueuerId.compareAndSet(sourceToken, member.token()) || member.token().equals(currentEnqueuerId.get()))
+            currentEnqueuerName.set(member.name());
+    }
+
+    public synchronized PlayerState getCurrentPlayerState() {
+        PlayableMusic music = currentMusic.get();
+        NowPlayingInfo infoToSend = null;
+
+        if (music != null) {
+            infoToSend = new NowPlayingInfo(
+                    music,
+                    calculateCurrentPosition(), // 直接返回计算好的进度
+                    currentEnqueuerId.get(),
+                    currentEnqueuerName.get(),
+                    currentLikedUserIds,
+                    currentLikeMarkers
+            );
+        }
+
+        Set<String> onlineTokens = userService.getRecentlyActiveUserTokens();
+        int currentVoteCount = (int) skipVotes.stream().filter(onlineTokens::contains).count();
+        int eligibleCount = calculateEligibleUsers(onlineTokens);
+
+        PlayMode currentPlayMode = playMode.get();
+        return new PlayerState(
+                infoToSend,
+                getQueueWithUpdatedStatus(),
+                currentPlayMode.name(),
+                allowOfflineShuffle.get(),
+                userService.getOnlineUserSummaries(),
+                isPaused.get(),
+                isPauseLocked.get(),
+                isSkipLocked.get(),
+                isPlayModeLocked.get(),
+                isLoading.get(),
+                liveStreamService.getStreamListenerCount(),
+                liveStreamService.isEnabled(),
+                isVoteSkipEnabled.get(),
+                voteSkipThreshold.get(),
+                voteSkipWaitTime.get(),
+                currentVoteCount,
+                eligibleCount,
+                seekNonce.get(),
+                playbackId,
+                new PlayerState.AppConfigSummary(
+                        appProperties.getQueue().getMaxSize(),
+                        appProperties.getQueue().getHistorySize(),
+                        appProperties.getQueue().getMaxUserSongs(),
+                        appProperties.getPlayer().getMaxPlaylistImportSize(),
+                        appProperties.getChat().getMaxHistorySize(),
+                        appProperties.getChat().getMinIntervalMs(),
+                        appProperties.getChat().getMaxMessageLength(),
+                        appProperties.getBilibili().getMaxDurationMinutes(),
+                        isVoteSkipEnabled.get(),
+                        voteSkipThreshold.get(),
+                        voteSkipWaitTime.get(),
+                        new PlayerState.AppConfigSummary.PrivateDjConfigSummary(
+                                appProperties.getPrivateDj().getMode(),
+                                appProperties.getPrivateDj().isFillBlankEnabled(),
+                                appProperties.getPrivateDj().isJoinQueueEnabled(),
+                                appProperties.getPrivateDj().isCustodyEnabled(),
+                                privateDjService.sourceId(),
+                                privateDjService.supportsMode("FM"),
+                                privateDjService.supportsMode("DJ")
+                        ),
+                        appProperties.getQueue().isAllowPlaylistClaim(),
+                        appProperties.getQueue().isRetainPlaylist(),
+                        appProperties.getPlayer().isAllowSeek(),
+                        getSourceSettings(),
+                        privateDjService.isAvailable()
+                ),
+                queueManager.getMemberShufflePreferences()
+        );
+    }
+
+    private int calculateEligibleUsers(Set<String> onlineTokens) {
+        String enqueuerToken = currentEnqueuerId.get();
+        // 必须是在线、活跃、非游客、且不是点歌者
+        return (int) userService.getOnlineUserSummaries().stream()
+                .filter(u -> !u.isGuest())
+                .filter(u -> onlineTokens.contains(u.token()))
+                .filter(u -> !u.token().equals(enqueuerToken))
+                .count();
+    }
+
+    public void toggleAllowOfflineShuffle(String sessionId) {
+        if (isRateLimited(sessionId)) return;
+        boolean current;
+        boolean newState;
+        do {
+            current = allowOfflineShuffle.get();
+            newState = !current;
+        } while (!allowOfflineShuffle.compareAndSet(current, newState));
+
+        log.info("Allow offline shuffle set to {} by {}", newState, getUserName(sessionId));
+        broadcastFullPlayerState();
+    }
+
+    public int clearOfflineSongs() {
+        Set<String> onlineTokens = userService.getRecentlyActiveUserTokens();
+        List<MusicQueueItem> snapshot = queueManager.getQueueSnapshot();
+        int removedCount = 0;
+        for (MusicQueueItem item : snapshot) {
+            if (!onlineTokens.contains(item.enqueuedBy().token())) {
+                queueManager.remove(item.queueId());
+                removedCount++;
+            }
+        }
+        log.info("Cleared {} songs from offline users.", removedCount);
+        broadcastQueueUpdate();
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.WARN, PlayerAction.SYSTEM_MESSAGE, "SYSTEM", "管理员已清理 " + removedCount + " 首离线成员的点播歌曲"));
+        return removedCount;
+    }
+
+    public void setLock(String type, boolean locked) {
+        AtomicBoolean targetLock;
+        String desc;
+        switch (type.toUpperCase()) {
+            case "PAUSE" -> { targetLock = isPauseLocked; desc = "暂停"; }
+            case "SKIP" -> { targetLock = isSkipLocked; desc = "切歌"; }
+            case "SHUFFLE" -> { targetLock = isPlayModeLocked; desc = "播放模式"; }
+            default -> throw new IllegalArgumentException("Unknown lock type");
+        }
+
+        boolean old = targetLock.getAndSet(locked);
+        if (old != locked) {
+            log.info("{} lock set to: {}", desc, locked);
+            broadcastFullPlayerState();
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.WARN, PlayerAction.SYSTEM_MESSAGE, "SYSTEM",
+                    locked ? "管理员锁定了" + desc : "管理员解锁了" + desc));
+        }
+    }
+
+    public void setAllLocks(boolean locked) {
+        isPauseLocked.set(locked);
+        isSkipLocked.set(locked);
+        isPlayModeLocked.set(locked);
+        broadcastFullPlayerState();
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.WARN, PlayerAction.SYSTEM_MESSAGE, "SYSTEM",
+                locked ? "管理员锁定了所有控制" : "管理员解锁了所有控制"));
+    }
+
+    /** 捕获当前播放相关运行时设置（持久化用）。只读 Atomic 字段——它们是 updateConfig 的运行时真相。 */
+    public SettingsSnapshot.PlayerSettings getPlayerSettings() {
+        return new SettingsSnapshot.PlayerSettings(
+                playMode.get().name(),
+                allowOfflineShuffle.get(),
+                isVoteSkipEnabled.get(),
+                voteSkipThreshold.get(),
+                voteSkipWaitTime.get(),
+                isPauseLocked.get(),
+                isSkipLocked.get(),
+                isPlayModeLocked.get());
+    }
+
+    /** 回填持久化的播放设置。逐字段判空；playMode 是唯一模式状态。 */
+    public void applyPlayerSettings(SettingsSnapshot.PlayerSettings s) {
+        if (s == null) return;
+        if (s.playMode() != null) {
+            try {
+                PlayMode mode = PlayMode.valueOf(s.playMode());
+                playMode.set(mode);
+            } catch (IllegalArgumentException e) {
+                log.warn("Ignored invalid persisted playMode: {}", s.playMode());
+            }
+        }
+        if (s.allowOfflineShuffle() != null) allowOfflineShuffle.set(s.allowOfflineShuffle());
+        if (s.voteSkipEnabled() != null) isVoteSkipEnabled.set(s.voteSkipEnabled());
+        if (s.voteSkipThreshold() != null) voteSkipThreshold.set(s.voteSkipThreshold());
+        if (s.voteSkipWaitTime() != null) voteSkipWaitTime.set(s.voteSkipWaitTime());
+        if (s.pauseLocked() != null) isPauseLocked.set(s.pauseLocked());
+        if (s.skipLocked() != null) isSkipLocked.set(s.skipLocked());
+        if (s.playModeLocked() != null) isPlayModeLocked.set(s.playModeLocked());
+    }
+
+    public void enqueue(EnqueueRequest request, String sessionId) {
+        Optional<User> userOpt = userService.getUser(sessionId);
+        if (userOpt.isEmpty()) return;
+        User enqueuer = userOpt.get();
+
+        if (!sourceRegistry.isEnabled(request.platform())) {
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.SYSTEM_MESSAGE,
+                    enqueuer.getToken(), "添加失败: 音源不可用"));
+            return;
+        }
+
+        // Check user song limit
+        long userSongCount = queueManager.getQueueSnapshot().stream()
+                .filter(item -> item.enqueuedBy().token().equals(enqueuer.getToken()))
+                .count();
+
+        if (userSongCount >= appProperties.getQueue().getMaxUserSongs()) {
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.SYSTEM_MESSAGE, enqueuer.getToken(), "添加失败: 您的点歌数量已达上限 (" + appProperties.getQueue().getMaxUserSongs() + "首)"));
+            return;
+        }
+
+        mediaDeliveryService.getMetadata(request.platform(), request.musicId())
+                .subscribe(music -> {
+                            if (!sourceRegistry.isEnabled(music.platform())) return;
+                            QueueItemStatus initialStatus = mediaDeliveryService.status(music);
+
+                            MusicQueueItem newItem = queueManager.add(music, new UserSummary(enqueuer.getToken(), enqueuer.getSessionId(), enqueuer.getName(), enqueuer.isGuest()), initialStatus);
+
+                            if (newItem != null) {
+                                mediaDeliveryService.prefetch(music);
+                                log.info("{} enqueued: {}", enqueuer.getName(), music.name());
+                                broadcastQueueUpdate();
+                                eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.SUCCESS, PlayerAction.ADD, enqueuer.getToken(), music.name()));
+                            } else if (mediaDeliveryService.status(music) == QueueItemStatus.FAILED) {
+                                // 用户重新点同一首失败曲目：清掉失败标记并重新下载，而不是静默忽略
+                                mediaDeliveryService.retry(music);
+                                log.info("{} re-enqueued failed track, retrying: {}", enqueuer.getName(), music.name());
+                                broadcastQueueUpdate();
+                                eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.SUCCESS, PlayerAction.ADD, enqueuer.getToken(), "重新尝试下载：" + music.name()));
+                            }
+                        },
+                        error -> {
+                            log.error("Enqueue failed for musicId: {}", request.musicId(), error);
+                            String msg = org.thornex.musicparty.service.api.SourceAuth.userMessage(
+                                    Objects.toString(error.getMessage(), "音源请求失败"));
+                            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.SYSTEM_MESSAGE, enqueuer.getToken(), "添加失败: " + msg));
+                        });
+    }
+
+    // 点赞逻辑
+    public void likeSong(String sessionId, Long clientPositionMs) {
+        PlayableMusic music = currentMusic.get();
+        if (music == null) return;
+
+        String token = getUserToken(sessionId);
+
+        // 1. 检查去重 (单人单曲一次)
+        if (currentLikedUserIds.contains(token)) return;
+
+        // 2. 更新数据
+        currentLikedUserIds.add(token);
+
+        // 3. 打点位置：优先用客户端上报的音频位置（用户实际听到的时刻），
+        //    否则回退到服务器推算进度。服务器时钟在 applyNewSong 时就开始走、
+        //    音频要等缓冲/转码后才起播，直接用服务器进度会让打点超前于听感位置。
+        long progress;
+        if (clientPositionMs != null) {
+            long duration = music.duration();
+            progress = duration > 0
+                    ? Math.max(0, Math.min(duration, clientPositionMs))
+                    : Math.max(0, clientPositionMs);
+        } else {
+            progress = calculateCurrentPosition();
+        }
+        currentLikeMarkers.add(progress);
+
+        log.info("Like received from {}", getUserName(sessionId));
+
+        // 3. 广播
+        // 广播事件用于触发特效
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.SUCCESS, PlayerAction.LIKE, token, music.name()));
+        // 广播状态更新进度条打点和用户列表
+        broadcastFullPlayerState();
+    }
+
+    public synchronized void topSong(String queueId, String sessionId) {
+        // 先调用 top 执行置顶操作
+        TopResult result = queueManager.top(queueId, playMode.get());
+        
+        if (result != TopResult.NONE) {
+            log.info("Song topped ({}) request by {}", result, getUserName(sessionId));
+            broadcastQueueUpdate();
+
+            // 只有全局置顶才发送系统消息广播
+            if (result == TopResult.GLOBAL) {
+                String songName = queueManager.getItem(queueId)
+                        .map(item -> item.music().name())
+                        .orElse("未知歌曲");
+                eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO, PlayerAction.TOP, getUserToken(sessionId), songName));
+            }
+            
+            if (currentMusic.get() == null) {
+                playNextInQueue();
+            }
+        }
+    }
+
+    public void removeSongFromQueue(String queueId, String sessionId) {
+        Optional<MusicQueueItem> removedItem = queueManager.remove(queueId);
+        if (removedItem.isPresent()) {
+            log.info("Removed song from queue by {}", getUserName(sessionId));
+            broadcastQueueUpdate();
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO, PlayerAction.REMOVE, getUserToken(sessionId), removedItem.get().music().name()));
+        }
+    }
+
+    public void skipToNext(String sessionId) {
+        if (isRateLimited(sessionId)) return;
+        
+        // 管理员通过控制面板切歌 (SYSTEM) 或未开启投票模式，直接切歌
+        if ("SYSTEM".equals(sessionId) || !isVoteSkipEnabled.get()) {
+            executeSkip(sessionId);
+            return;
+        }
+
+        // 投票模式逻辑
+        handleVoteSkip(sessionId);
+    }
+
+    private void handleVoteSkip(String sessionId) {
+        if (currentMusic.get() == null) return;
+        
+        Optional<User> userOpt = userService.getUser(sessionId);
+        if (userOpt.isEmpty() || userOpt.get().isGuest()) return;
+        
+        String token = userOpt.get().getToken();
+        String enqueuerToken = currentEnqueuerId.get();
+
+        // 特殊逻辑：点歌者切自己的歌，视为强制切歌，不走投票逻辑，且不设 15 秒限制
+        if (token.equals(enqueuerToken)) {
+            log.info("Enqueuer {} skipped their own song.", userOpt.get().getName());
+            executeSkip(sessionId);
+            return;
+        }
+
+        // 1. 检查播放时长 (15秒限制，仅针对投票者)
+        long currentPos = calculateCurrentPosition();
+        if (currentPos < voteSkipWaitTime.get() * 1000L) {
+            return;
+        }
+
+        // 2. 切换投票状态 (Toggle)
+        if (skipVotes.contains(token)) {
+            skipVotes.remove(token);
+        } else {
+            skipVotes.add(token);
+        }
+
+        // 3. 判定是否达成条件
+        checkVoteSkipThreshold();
+        
+        // 4. 广播状态更新 (用于前端角标)
+        broadcastFullPlayerState();
+    }
+
+    private void checkVoteSkipThreshold() {
+        Set<String> onlineTokens = userService.getRecentlyActiveUserTokens();
+        int currentVoteCount = (int) skipVotes.stream().filter(onlineTokens::contains).count();
+        int eligibleCount = calculateEligibleUsers(onlineTokens);
+
+        if (eligibleCount > 0 && (double) currentVoteCount / eligibleCount >= voteSkipThreshold.get()) {
+            String msg = String.format("投票切歌通过！(%d/%d 票)，正在进入下一首。", currentVoteCount, eligibleCount);
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO, PlayerAction.SYSTEM_MESSAGE, "SYSTEM", msg));
+            executeSkip("SYSTEM");
+        }
+    }
+
+    private synchronized void executeSkip(String sessionId) {
+        if (isSkipLocked.get() && !"SYSTEM".equals(sessionId)) {
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR, PlayerAction.SYSTEM_MESSAGE, getUserToken(sessionId), "切歌功能已被锁定"));
+            return;
+        }
+
+        // 切歌时版本号自增，废弃之前的任何 pending 请求
+        playHeadVersion.incrementAndGet();
+        isLoading.set(false);
+
+        currentMusic.set(null);
+        playbackId = null;
+        positionAnchor.set(0);
+
+        if (!"SYSTEM".equals(sessionId)) {
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO, PlayerAction.SKIP, getUserToken(sessionId), null));
+        }
+        playNextInQueue();
+    }
+
+    @Scheduled(fixedDelay = 10000)
+    public void prepareRestoredQueue() {
+        queueManager.getQueueSnapshot().stream().map(MusicQueueItem::music)
+                .filter(music -> !MusicQueueManager.FM_MARKER_ID.equals(music.platform()))
+                .filter(music -> sourceRegistry.isEnabled(music.platform()))
+                .filter(music -> mediaDeliveryService.status(music) == QueueItemStatus.PENDING)
+                .forEach(mediaDeliveryService::prefetch);
+    }
+
+    public void restoreSourceEnabled(String id, Boolean enabled) {
+        if (sourceRegistry.descriptors().stream().anyMatch(descriptor -> descriptor.id().equals(id))) {
+            sourceRegistry.update(id, enabled, null);
+        }
+    }
+
+    public Map<String, SourceSettings> getSourceSettings() {
+        return sourceRegistry.descriptors().stream().collect(Collectors.toMap(descriptor -> descriptor.id(),
+                descriptor -> new SourceSettings(sourceRegistry.isEnabled(descriptor.id()), sourceRegistry.deliveryMode(descriptor.id()))));
+    }
+
+    public void updateConfig(AdminConfigUpdateRequest request) {
+        if (request.sources() != null) {
+            request.sources().forEach((id, settings) -> {
+                if (settings == null) throw new ApiRequestException("Invalid source configuration");
+                sourceRegistry.descriptor(id);
+                if (settings.deliveryMode() != null && settings.deliveryMode() != sourceRegistry.deliveryMode(id)) {
+                    throw new ApiRequestException("DELIVERY_RESTART_REQUIRED: 修改交付类型需要更新部署配置并重启");
+                }
+            });
+            request.sources().forEach((id, settings) -> sourceRegistry.update(id, settings.enabled(), settings.deliveryMode()));
+        }
+        if (request.retainPlaylist() != null) {
+            synchronized (queueManager) {
+                appProperties.getQueue().setRetainPlaylist(request.retainPlaylist());
+            }
+        }
+        if (request.allowSeek() != null) {
+            appProperties.getPlayer().setAllowSeek(request.allowSeek());
+            broadcastFullPlayerState();
+        }
+        StringBuilder logMsg = new StringBuilder("System configuration updated: ");
+        
+        if (request.maxQueueSize() != null) {
+            appProperties.getQueue().setMaxSize(request.maxQueueSize());
+            logMsg.append("MaxQueueSize=").append(request.maxQueueSize()).append(" ");
+        }
+        if (request.maxHistorySize() != null) {
+            appProperties.getQueue().setHistorySize(request.maxHistorySize());
+            logMsg.append("HistorySize=").append(request.maxHistorySize()).append(" ");
+        }
+        if (request.maxUserSongs() != null) {
+            appProperties.getQueue().setMaxUserSongs(request.maxUserSongs());
+            logMsg.append("MaxUserSongs=").append(request.maxUserSongs()).append(" ");
+        }
+        if (request.maxPlaylistImportSize() != null) {
+            appProperties.getPlayer().setMaxPlaylistImportSize(request.maxPlaylistImportSize());
+            logMsg.append("MaxPlaylistImportSize=").append(request.maxPlaylistImportSize()).append(" ");
+        }
+        if (request.maxChatHistorySize() != null) {
+            appProperties.getChat().setMaxHistorySize(request.maxChatHistorySize());
+            logMsg.append("MaxChatHistorySize=").append(request.maxChatHistorySize()).append(" ");
+        }
+        if (request.minChatIntervalMs() != null) {
+            appProperties.getChat().setMinIntervalMs(request.minChatIntervalMs());
+            logMsg.append("MinChatInterval=").append(request.minChatIntervalMs()).append("ms ");
+        }
+        if (request.maxChatMessageLength() != null) {
+            appProperties.getChat().setMaxMessageLength(request.maxChatMessageLength());
+            logMsg.append("MaxChatMessageLength=").append(request.maxChatMessageLength()).append(" ");
+        }
+        if (request.bilibiliMaxDurationMinutes() != null) {
+            appProperties.getBilibili().setMaxDurationMinutes(request.bilibiliMaxDurationMinutes());
+            logMsg.append("BilibiliMaxDurationMinutes=").append(request.bilibiliMaxDurationMinutes()).append(" ");
+        }
+
+        if (request.voteSkipEnabled() != null) {
+            isVoteSkipEnabled.set(request.voteSkipEnabled());
+            logMsg.append("VoteSkipEnabled=").append(request.voteSkipEnabled()).append(" ");
+        }
+        if (request.voteSkipThreshold() != null) {
+            voteSkipThreshold.set(request.voteSkipThreshold());
+            logMsg.append("VoteSkipThreshold=").append(request.voteSkipThreshold()).append(" ");
+        }
+        if (request.voteSkipWaitTime() != null) {
+            voteSkipWaitTime.set(request.voteSkipWaitTime());
+            logMsg.append("VoteSkipWaitTime=").append(request.voteSkipWaitTime()).append("s ");
+        }
+
+        if (request.sources() != null) {
+            prepareRestoredQueue();
+        }
+        log.info(logMsg.toString().trim());
+        
+        // 关键增强：如果更新了投票相关配置，立即触发一次阈值检查
+        if (isVoteSkipEnabled.get() && currentMusic.get() != null) {
+            checkVoteSkipThreshold();
+        }
+
+        broadcastFullPlayerState();
+    }
+
+    public synchronized void seekTo(String sessionId, long positionMs, String expectedPlaybackId) {
+        PlayableMusic music = currentMusic.get();
+        if (music == null || playbackId == null || !playbackId.equals(expectedPlaybackId)) return;
+        boolean system = "SYSTEM".equals(sessionId);
+        if (!system && !appProperties.getPlayer().isAllowSeek()) {
+            eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.ERROR,
+                    PlayerAction.SYSTEM_MESSAGE, getUserToken(sessionId), "当前不允许拖动进度条"));
+            return;
+        }
+        // 注意：这里刻意不检查 isSkipLocked。锁定切歌只约束「换歌」，
+        // 拖动进度条仍允许（管理员已单独用 allowSeek 授权进度控制）。
+        if (!system && isRateLimited(sessionId)) return;
+
+        long duration = music.duration();
+        long target = clampSeek(positionMs, duration);
+        positionAnchor.set(target);
+        timestampAnchor.set(System.currentTimeMillis());
+        seekNonce.incrementAndGet();
+        broadcastFullPlayerState();
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO,
+                PlayerAction.SYSTEM_MESSAGE, getUserToken(sessionId), "已跳转到 " + formatSeekTime(target)));
+    }
+
+    private static String formatSeekTime(long ms) {
+        long totalSeconds = Math.max(0, ms) / 1000;
+        return String.format("%d:%02d", totalSeconds / 60, totalSeconds % 60);
+    }
+
+    /**
+     * 把目标位置裁到合法区间 [0, duration-500]；duration 未知（<=0）时只保证非负。
+     * 留 500ms 余量，避免拖到末尾直接触发 ended。
+     */
+    static long clampSeek(long positionMs, long duration) {
+        long target = Math.max(0, positionMs);
+        if (duration <= 0) return target;
+        return Math.min(target, Math.max(0, duration - 500));
+    }
+
+    public synchronized void togglePause(String sessionId) {
+        if (currentMusic.get() == null) {
+            if (!queueManager.getQueueSnapshot().isEmpty()) {
+                playNextInQueue();
+            }
+            return;
+        }
+        if (isRateLimited(sessionId)) return;
+
+        // 锁定检查：如果是系统操作，放行。如果是用户操作，检查锁。
+        // 规则：如果不控制播放权限（允许从暂停->播放），则只有当当前是播放状态(即试图暂停)且锁定时才拦截。
+        if (!"SYSTEM".equals(sessionId)) {
+            if (isPauseLocked.get() && !isPaused.get()) {
+                // eventPublisher.publishEvent(...);
+                return;
+            }
+        }
+
+        // 核心：在切换状态的一瞬间，更新 Anchor
+        // 1. 先计算出当前的进度
+        long currentPos = calculateCurrentPosition();
+
+        // 2. 更新状态
+        boolean newState = !isPaused.get();
+        isPaused.set(newState);
+
+        // 3. 重置锚点：无论是暂停还是播放，当前进度都变成新的基准进度
+        positionAnchor.set(currentPos);
+        timestampAnchor.set(System.currentTimeMillis());
+
+        log.info("Player {} by {}", newState ? "PAUSED" : "RESUMED", getUserName(sessionId));
+        broadcastFullPlayerState();
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO, newState ? PlayerAction.PAUSE : PlayerAction.PLAY, getUserToken(sessionId), null));
+    }
+
+    public PlayMode getPlayMode() { return playMode.get(); }
+
+    public synchronized boolean setPlayMode(String sessionId, String requested) {
+        if (!"SYSTEM".equals(sessionId) && userService.getUser(sessionId).map(User::isGuest).orElse(true)) return false;
+        PlayMode next;
+        try { next = PlayMode.valueOf(requested); }
+        catch (IllegalArgumentException | NullPointerException error) { return false; }
+        if (isPlayModeLocked.get() && !"SYSTEM".equals(sessionId)) return false;
+        if (playMode.get() == next) return true;
+        if (!"SYSTEM".equals(sessionId) && isRateLimited(sessionId)) return false;
+        playMode.set(next);
+        syncFmMarker();
+        broadcastFullPlayerState();
+        broadcastQueueUpdate();
+        String modeName = switch (next) {
+            case SEQUENTIAL -> "顺序播放";
+            case SHUFFLE -> "随机播放";
+            case ROUND_ROBIN -> "轮询播放";
+            case REPEAT_ONE -> "单曲循环";
+        };
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.INFO,
+                PlayerAction.MODE_CHANGE, getUserToken(sessionId), modeName));
+        return true;
+    }
+
+    public synchronized void resetSystem() {
+        log.warn("!!!SYSTEM RESET INITIATED!!!");
+        playHeadVersion.incrementAndGet();
+        currentMusic.set(null);
+        playbackId = null;
+        positionAnchor.set(0);
+        timestampAnchor.set(0);
+
+        queueManager.clearAll();
+        isPaused.set(false);
+        playMode.set(PlayMode.SEQUENTIAL);
+        isLoading.set(false);
+
+        broadcastFullPlayerState();
+        broadcastQueueUpdate();
+        log.warn("System reset complete.");
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.WARN, PlayerAction.RESET, "SYSTEM", null));
+    }
+
+    public void clearQueue() {
+        queueManager.clearPendingQueue();
+        log.info("Queue cleared by Admin.");
+        // 广播队列更新
+        broadcastQueueUpdate();
+        // 发送全员通知
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.WARN, PlayerAction.SYSTEM_MESSAGE, "SYSTEM", "管理员已清空播放列表"));
+    }
+
+    @EventListener
+    public void handleDownloadEvent(DownloadStatusEvent event) {
+        boolean existsInQueue = queueManager.getQueueSnapshot().stream()
+                .anyMatch(item -> ResourceKey.encode(item.music().platform(), item.music().id()).equals(event.getMusicId()));
+
+        if (existsInQueue) {
+            log.debug("Download status changed for {}, updating queue UI.", event.getMusicId());
+            broadcastQueueUpdate();
+            if (currentMusic.get() == null) {
+                playNextInQueue();
+            }
+        }
+    }
+
+    /**
+     * 监听用户数量变化事件
+     */
+    @EventListener
+    public void onUserCountChanged(UserCountChangeEvent event) {
+        if (event.getOnlineUserCount() == 0 && !isStreamActive.get()) {
+            enterIdleMode();
+        }
+        
+        // 用户变动时重新检查投票阈值
+        if (isVoteSkipEnabled.get() && currentMusic.get() != null) {
+            checkVoteSkipThreshold();
+            broadcastFullPlayerState();
+        }
+    }
+
+    /**
+     * 监听直播流状态变化
+     */
+    @EventListener
+    public void onStreamStatusChanged(StreamStatusEvent event) {
+        boolean hasListeners = event.isHasListeners();
+        this.isStreamActive.set(hasListeners);
+        log.info("System: Stream active status changed to: {}, Count: {}", hasListeners, event.getListenerCount());
+
+        if (hasListeners) {
+            // 场景 A: 列表为空，有人连入流 -> 尝试开始播放下一首
+            if (currentMusic.get() == null) {
+                playNextInQueue();
+            } 
+            // 场景 B: 正在暂停中，且网页端没人，有人连入流 -> 自动恢复播放
+            else if (isPaused.get() && userService.getOnlineUserSummaries().isEmpty()) {
+                log.info("System: Auto-resuming player for new stream listener.");
+                togglePause("SYSTEM");
+            }
+        } else {
+            // 场景 C: 流用户离开，且网页端也没人 -> 进入休眠
+            // 额外校验确无流连接：并发的 addListener 可能在旧监听者断开后才登记新连接，
+            // 此时陈旧的 StreamStatusEvent(false) 不应把播放器误送入休眠
+            if (userService.getOnlineUserSummaries().isEmpty() && liveStreamService.getStreamConnectionCount() == 0) {
+                enterIdleMode();
+            }
+        }
+        broadcastFullPlayerState();
+    }
+
+    /**
+     * 进入空闲模式，停止播放
+     */
+    private synchronized void enterIdleMode() {
+        log.info("Last user disconnected. Entering idle mode.");
+        isLoading.set(false);
+
+        // 如果正在播放，自动暂停，记录当前进度
+        if (currentMusic.get() != null && !isPaused.get()) {
+            long currentPos = calculateCurrentPosition();
+
+            if (isPaused.compareAndSet(false, true)) {
+                // 暂停时，更新锚点为刚才计算出的准确进度
+                positionAnchor.set(currentPos);
+                timestampAnchor.set(System.currentTimeMillis()); // 这个时间在暂停期间主要用于超时判断
+
+                log.info("Player paused as all users have disconnected. Position saved at: {}", currentPos);
+                broadcastFullPlayerState();
+            }
+        }
+    }
+
+    /**
+     * 定时清理空房间中长时间暂停的媒体，保留暂停状态
+     */
+    @Scheduled(fixedRate = 600000) // 每10分钟检查一次
+    public void cleanupIdlePlayer() {
+        synchronized (this) {
+            if (!userService.getOnlineUserSummaries().isEmpty()
+                    || liveStreamService.getStreamConnectionCount() > 0) {
+                return;
+            }
+            if (isPaused.get() && currentMusic.get() != null) {
+                // 在暂停状态下，timestampAnchor 记录的是暂停开始的时间
+                long pausedDuration = System.currentTimeMillis() - timestampAnchor.get();
+                if (pausedDuration > IDLE_RESET_TIMEOUT_MS) {
+                    log.info("Empty idle room timeout reached. Clearing paused media without resuming.");
+                    currentMusic.set(null);
+                    playbackId = null;
+                    positionAnchor.set(0);
+                    timestampAnchor.set(0);
+                    // Keep isPaused=true: cleanup must not make playerLoop start the next song.
+                    broadcastFullPlayerState();
+                }
+            }
+        }
+    }
+
+    /**
+     * 周期状态广播（心跳）：让所有客户端周期性重锚播放进度，主动防漂移，
+     * 同时让客户端能通过"长时间收不到广播"识别假连接。空闲（无曲且暂停）时跳过。
+     */
+    @Scheduled(fixedRateString = "${app.music-api.player.sync-broadcast-interval-ms:5000}")
+    public void broadcastSyncHeartbeat() {
+        if (currentMusic.get() == null && isPaused.get()) {
+            return;
+        }
+        broadcastFullPlayerState();
+    }
+
+    // --- Broadcasting and Helper Methods ---
+
+    public void broadcastQueueUpdate() {
+        eventPublisher.publishEvent(new QueueUpdateEvent(this, getQueueWithUpdatedStatus()));
+    }
+
+    public void broadcastFullPlayerState() {
+        eventPublisher.publishEvent(new PlayerStateEvent(this, getCurrentPlayerState()));
+    }
+
+    public void broadcastOnlineUsers() {
+        // This is triggered by UserService, so we can keep it simple or create another event type
+        broadcastFullPlayerState();
+    }
+
+    public void broadcastPasswordChanged() {
+        eventPublisher.publishEvent(new SystemMessageEvent(this, SystemMessageEvent.Level.WARN, PlayerAction.SYSTEM_MESSAGE, "SYSTEM", "房间密码已更改，请重新验证"));
+    }
+
+    private QueueItemStatus deliveryStatus(Music music) {
+        if (MusicQueueManager.FM_MARKER_ID.equals(music.platform())) return QueueItemStatus.READY;
+        if (!sourceRegistry.isEnabled(music.platform())) return QueueItemStatus.PENDING;
+        return mediaDeliveryService.status(music);
+    }
+
+    private List<MusicQueueItem> getQueueWithUpdatedStatus() {
+        return queueManager.getQueueSnapshot().stream()
+                .map(item -> item.withStatus(deliveryStatus(item.music())))
+                .toList();
+    }
+
+    private Map<String, QueueItemStatus> buildStatusMap() {
+        Map<String, QueueItemStatus> statusMap = new HashMap<>();
+        for (MusicQueueItem item : queueManager.getQueueSnapshot()) {
+            statusMap.put(ResourceKey.encode(item.music().platform(), item.music().id()), deliveryStatus(item.music()));
+        }
+        return statusMap;
+    }
+
+    /*private void resetPauseState() {
+        isPaused.set(false);
+        pauseStateChangeTime.set(0);
+        totalPausedTimeMillis.set(0);
+    }*/
+
+    private boolean isRateLimited(String userId) {
+        long now = System.currentTimeMillis();
+        if (now - lastControlTimestamp.get() < GLOBAL_COOLDOWN_MS) {
+            log.warn("Action rate limited for user: {}", userId);
+            // eventPublisher.publishEvent(...); // Optional: notify user about rate limit
+            return true;
+        }
+        lastControlTimestamp.set(now);
+        return false;
+    }
+
+    public AppProperties getAppProperties() {
+        return appProperties;
+    }
+
+    private String getUserToken(String sessionId) {
+        if ("SYSTEM".equals(sessionId)) return "SYSTEM";
+        return userService.getUser(sessionId).map(User::getToken).orElse("UNKNOWN_TOKEN");
+    }
+
+    private String getUserName(String sessionId) {
+        return userService.getUser(sessionId).map(User::getName).orElse("Unknown User");
+    }
+}
