@@ -1,8 +1,8 @@
 # MusicParty Desktop
 
-MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用，将桌面客户端与本地服务集成为一个发行版本。与朋友进入房间后，可以一起管理播放队列、聊天和分享音乐，同时保留本机独立的音量与静音控制。
+MusicParty Desktop（MPD）是由 Cuiside 设计和开发的 Windows 多人听歌桌面客户端。它围绕 MusicParty 的房间服务重新设计了桌面界面，加入桌面歌词、托盘、本机音量控制和本地服务管理，让你可以和朋友一起点歌、聊天和分享音乐。
 
-> 本项目**基于 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 开发**。感谢 MusicParty 原作者及贡献者提供的开源项目与付出！本项目依托于原项目服务端运行，独立维护的桌面扩展，并非原项目官方发行版。
+> 本项目基于 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 的服务端与网页端开发。感谢原作者和贡献者创造了 MusicParty，让这个桌面客户端有了共同听歌的基础。
 
 ## 下载
 
@@ -43,10 +43,13 @@ MusicParty Desktop（MPD）是面向 Windows 的多人一起听歌桌面应用�
 使用网易云等第三方服务时，可能需要自行配置账号凭证。请勿将 Cookie、密码、房间管理凭证等分享给他人，也不要提交到公开仓库。请只在信任的网络及房间中使用；将服务暴露到公网前，应自行检查访问控制、默认密码及网络安全配置。
 
 ## 源码与开发
-- 基于MusicPatry网页端，重写了桌面 UI（`src/` ），内置服务端源码快照（`server-source/` ），使用`electron/` 做进程编排、托盘、歌词和配置加密。与服务端共享协议：REST（`/api/*` ）+ STOMP（`/ws` 、`/app` 、`/topic` 、`/user` ），可直接连接上游仓库最新版本网页端房间。
-- `src/`、`electron/` 和 `native/`：桌面应用源码；`tests/` 是桌面客户端的测试。
-- `server-source/`：0.9.7 内置服务端对应的源码快照及其 Web 前端；该发行版沿用 0.9.6 的服务端制品。
+
+- `src/`：参考 MusicParty 网页端的功能与交互，为桌面应用重新设计和实现的客户端界面，以及与服务端通信的代码。
+- `electron/` 和 `native/`：桌面窗口、本地服务进程管理、系统托盘、桌面歌词和配置加密等功能；`tests/` 为桌面客户端测试。
+- `server-source/`：基于上游 MusicParty 的服务端源码快照及 Web 前端；0.9.7 发行版沿用 0.9.6 的服务端制品。
 - `public/demo-audio/`：演示音乐及其署名说明。运行缓存、用户配置、第三方运行时和发行包没有包含在源码仓库中。
+
+桌面客户端通过 MusicParty 的 REST 接口和 STOMP/WebSocket 协议连接房间，既可使用内置服务，也可连接兼容的 MusicParty 服务端。
 
 Windows 上安装 Node.js 和 npm 后，在仓库根目录运行 `npm ci`、`npm run build` 和 `npm test`；运行 `node --test tests/unit/*.test.mjs` 可执行客户端单元测试。服务端位于 `server-source/`，使用 JDK 21 或以上及其中的 Maven Wrapper 构建；Web 前端位于 `server-source/music-party-web/`。
 
@@ -57,7 +60,7 @@ Windows 上安装 Node.js 和 npm 后，在仓库根目录运行 `npm ci`、`npm
 
 ## 致谢与第三方许可
 
-- **MusicParty**：感谢 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 的作者与贡献者。上游 README 声明使用 MIT License；本项目与上游项目保持各自维护。
+- **MusicParty**：衷心感谢 [PluvIIter/MusicParty](https://github.com/PluvIIter/MusicParty) 的作者及所有贡献者。本项目使用了上游服务端和 Web 前端源码，以及房间连接、歌曲搜索、音源接入、播放同步、队列、聊天和管理等功能所依赖的接口与协议；桌面客户端的功能与交互也参考了上游网页端。上游项目为多人听歌体验和本项目的开发提供了基础。上游 README 声明使用 MIT License，服务端源码来源见 [SOURCE-NOTICE](server-source/SOURCE-NOTICE.md)。
 - **NetEaseCloudMusicApiEnhanced**：项目及其贡献者提供的网易云音乐接口；相关许可见 [许可证](docs/NETEASE-API-LICENSE.txt) 和 [说明](docs/NETEASE-API-NOTICE.txt)。
 - **QQMusicApi**：感谢 [L-1124/QQMusicApi](https://github.com/L-1124/QQMusicApi) 及其贡献者提供的 QQ 音乐接口。该第三方服务按 [GPL-3.0](docs/QQMUSIC-API-GPL-3.0.txt) 授权；其源码及许可证以该项目为准。
 - **OpenAI Codex**：感谢 [Codex](https://openai.com/codex/) 协助开发、测试及文档整理。
